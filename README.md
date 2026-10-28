@@ -298,3 +298,8 @@ listens on 127.0.0.1.
   diarization and echo cancellation on Core ML
 - [NVIDIA Parakeet TDT v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) (CC BY 4.0)
 - [pyannote](https://github.com/pyannote/pyannote-audio) speaker diarization (MIT)
+
+## License
+
+Public domain ([Unlicense](LICENSE)). Do anything you like with it: use, copy, modify, sell, no attribution needed.
+The speech models and FluidAudio keep their own licences (listed under Credits).
