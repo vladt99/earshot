@@ -1,0 +1,7 @@
+.build/
+.swiftpm/
+dist/
+.signing.env
+private/
+.DS_Store
+*.xcodeproj/xcuserdata/
