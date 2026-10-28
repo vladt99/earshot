@@ -111,6 +111,29 @@ Models live in `~/Library/Application Support/FluidAudio/Models/`; Settings → 
 delete or re-download each one. Transcripts and recordings are in `~/Library/Application Support/Earshot/`. Each
 meeting has its own folder with `others.wav` (the other participants) and `me.wav` (you).
 
+## Performance
+
+Measured on a MacBook Pro with an M2 Max (8 performance + 4 efficiency cores) and 32 GB of RAM, Earshot 0.8.0,
+with other apps running as usual. The test meeting is an 8.5-minute dialogue between two voices, played through the
+speakers and recorded with the microphone on, echo cancellation on and speaker labels on.
+
+| Scenario | CPU average | CPU p95 | Memory average | Memory peak | Time |
+|---|---|---|---|---|---|
+| Idle in the menu bar | 0.6 % | 0 % | 121 MB | 121 MB | |
+| Live meeting: app audio + microphone, live transcript, speaker labels | 85 % | 132 % | 421 MB | 818 MB | real time |
+| Polishing the saved meeting (both tracks) | 125 % | | | 866 MB | 30 s |
+| File transcription, with speaker labels | 118 % | 130 % | 385 MB | 810 MB | 20 s (26× real time) |
+| File transcription, without speaker labels | 126 % | | | | 15 s (34× real time) |
+
+- CPU is a percentage of one core, as in Activity Monitor: 85 % is less than a tenth of this 12-core Mac.
+- Much of the speech model runs on the Neural Engine and the GPU, which these CPU figures don't include.
+- After a meeting, memory drops back to about 200 MB.
+- Recording uses about 30 MB of disk per 8.5 minutes (two 16 kHz tracks), roughly 220 MB per hour.
+- Speaker labels are recomputed over the whole recording during a meeting, so CPU use creeps up with length (83 %
+  in the first minute, 105 % in the ninth). Meetings of several hours haven't been measured yet.
+
+Sampled every second with `top` for the Earshot process; CPU averages come from its total CPU time.
+
 ## Local API
 
 Earshot serves an API on `http://127.0.0.1:7788` that is only reachable from your Mac. Every route except `/health`
