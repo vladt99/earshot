@@ -26,6 +26,8 @@ struct Transcript: Codable, Hashable, Identifiable, Sendable {
     var folderID: String? = nil
     /// Bookmarks and typed notes taken during a meeting, at times on the transcript's clock.
     var notes: [Note]? = nil
+    /// Room, participants, captions and events of a meeting (nil for everything else).
+    var context: MeetingContext? = nil
 }
 
 /// A moment marked during a meeting: `kind` "bookmark" (hotkey/button) or "note" (typed text).

@@ -82,6 +82,7 @@ struct LiveMeetingView: View {
         VStack(alignment: .leading, spacing: 8) {
             if let m = state.meeting {
                 header(m)
+                SessionBanner(meeting: m)
                 if let stopAt = state.stoppingAt {
                     HStack {
                         TimelineView(.periodic(from: .now, by: 1)) { ctx in
@@ -141,16 +142,30 @@ struct LiveMeetingView: View {
     }
 
     private func header(_ m: MeetingSnapshot) -> some View {
-        HStack {
-            Circle().fill(.red).frame(width: 9, height: 9)
+        let saved = state.willSave(m)
+        return HStack {
+            if saved {
+                PulseDot(color: .red, pulsing: !m.stopping, size: 9).help("Recording")
+            } else {
+                Image(systemName: "captions.bubble").foregroundStyle(.secondary).help("Live Captions — not saved")
+            }
             VStack(alignment: .leading, spacing: 0) {
-                Text(m.title).font(.headline).lineLimit(1)
+                Text(m.isLiveCaptions && !saved ? "Live Captions" : m.title).font(.headline).lineLimit(1)
                 TimelineView(.periodic(from: m.startedAt, by: 1)) { ctx in
-                    Text("\(m.platform) · \(Duration.seconds(ctx.date.timeIntervalSince(m.startedAt)).formatted(.time(pattern: .hourMinuteSecond)))")
-                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    Text("\(saved ? (m.isLiveCaptions ? "Recording" : m.platform) : "Not saved") · \(Duration.seconds(ctx.date.timeIntervalSince(m.startedAt)).formatted(.time(pattern: .hourMinuteSecond)))")
+                        .font(.caption.monospacedDigit()).foregroundStyle(saved ? AnyShapeStyle(.secondary) : AnyShapeStyle(.orange))
                 }
             }
             Spacer()
+            let people = m.people
+            if !people.isEmpty {
+                Label("\(people.count)", systemImage: "person.2.fill").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    .help(people.map { $0.name + ($0.bot ? " (bot)" : $0.external ? " (guest)" : "") }.joined(separator: "\n"))
+                    .accessibilityLabel("\(people.count) participants")
+            }
+            if m.selfMuted {
+                Image(systemName: "mic.slash.fill").foregroundStyle(.orange).help("You're muted — your mic isn't recorded")
+            }
             if m.readingCaptions {
                 Image(systemName: "captions.bubble.fill").foregroundStyle(.secondary)
                     .help("Reading Meet captions to name speakers")
@@ -159,13 +174,14 @@ struct LiveMeetingView: View {
                 HStack(spacing: 6) {
                     Button("Copy") { state.copy(Formats.speakerText(m.lines)) }.buttonStyle(.glass)
                     if m.stopping {
-                        Label("Saving…", systemImage: "hourglass").font(.caption).foregroundStyle(.secondary)
+                        Label(saved ? "Saving…" : "Stopping…", systemImage: "hourglass").font(.caption).foregroundStyle(.secondary)
                     } else {
                         Button("Stop") { state.stopMeeting() }.buttonStyle(.glassProminent).tint(.red)
+                            .help(saved ? "Stop and save" : "Stop Live Captions (nothing is saved)")
                     }
                     Button { MeetingPanel.shared.hide() } label: { Image(systemName: "xmark") }
                         .buttonStyle(.glass)
-                        .help(m.stopping ? "Close" : "Hide (keeps recording)")
+                        .help(m.stopping ? "Close" : saved ? "Hide (keeps recording)" : "Hide (Live Captions keep running)")
                         .accessibilityLabel(m.stopping ? "Close" : "Hide live transcript")
                 }
                 .controlSize(.small)
@@ -175,16 +191,19 @@ struct LiveMeetingView: View {
     }
 
     private func transcript(_ m: MeetingSnapshot) -> some View {
-        ScrollViewReader { proxy in
+        let chats = Formats.chats(m.context)
+        let blocks = LiveBlock.make(m.lines, notes: m.notes, chats: chats)
+        return ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 6) {
-                    ForEach(Array(m.lines.enumerated()), id: \.offset) { _, line in
-                        ForEach(m.notes.filter { n in n.time < line.start && !m.lines.contains { $0.start < line.start && $0.start > n.time } }) { n in
-                            NoteLine(note: n)
+                LazyVStack(alignment: .leading, spacing: 8) {
+                    ForEach(blocks) { b in
+                        switch b.kind {
+                        case .note(let n): NoteLine(note: n)
+                        case .chat(let e): ChatLine(event: e) {}
+                        case .speech(let speaker, let text, let start):
+                            LineView(speaker: speaker ?? "", text: text, time: start, partial: false)
                         }
-                        LineView(speaker: line.speaker ?? "", text: line.text, time: line.start, partial: false)
                     }
-                    ForEach(m.notes.filter { n in !m.lines.contains { $0.start > n.time } }) { n in NoteLine(note: n) }
                     ForEach(m.hypotheses.filter { !$0.value.isEmpty }.sorted { $0.key < $1.key }, id: \.key) { speaker, text in
                         LineView(speaker: speaker, text: text, time: nil, partial: true)
                     }
@@ -192,7 +211,63 @@ struct LiveMeetingView: View {
                 }
                 .textSelection(.enabled)
             }
-            .onChange(of: m.lines.count + m.notes.count + m.hypotheses.values.joined().count) { proxy.scrollTo("bottom") }
+            .onChange(of: m.lines.count + m.notes.count + chats.count + m.hypotheses.values.joined().count) { proxy.scrollTo("bottom") }
+        }
+    }
+}
+
+/// The live transcript as paragraphs (same rules as the saved one), with notes and chat in time order.
+struct LiveBlock: Identifiable {
+    enum Kind { case speech(String?, String, Double), note(Note), chat(MeetingEvent) }
+    var id: String
+    var t: Double
+    var kind: Kind
+
+    static func make(_ lines: [Segment], notes: [Note], chats: [MeetingEvent]) -> [LiveBlock] {
+        var out = Formats.paragraphs(lines, breaks: notes.map(\.time) + chats.map(\.t)).map { p in
+            LiveBlock(id: "p\(p[0])", t: lines[p[0]].start,
+                      kind: .speech(lines[p[0]].speaker, p.map { lines[$0].text.trimmingCharacters(in: .whitespaces) }.joined(separator: " "), lines[p[0]].start))
+        }
+        out += notes.map { LiveBlock(id: "n" + $0.id, t: $0.time, kind: .note($0)) }
+        out += chats.enumerated().map { LiveBlock(id: "c\($0.offset)", t: $0.element.t, kind: .chat($0.element)) }
+        return out.enumerated().sorted { ($0.element.t, $0.offset) < ($1.element.t, $1.offset) }.map(\.element)
+    }
+}
+
+/// What happens to this session: Live Captions that vanish on Stop (with "Save as meeting"), Live Captions that will be
+/// kept, and your mute state.
+struct SessionBanner: View {
+    @Environment(AppState.self) private var state
+    let meeting: MeetingSnapshot
+    var compact = false
+
+    var body: some View {
+        let m = meeting
+        VStack(alignment: .leading, spacing: 6) {
+            if m.isLiveCaptions, !m.stopping {
+                if state.willSave(m) {
+                    Label(state.keptSessions.contains(m.id) ? "Will be saved as a meeting when you stop" :
+                            "A call is on: these Live Captions will be saved as a meeting", systemImage: "checkmark.circle.fill")
+                        .font(.caption).foregroundStyle(.green)
+                } else {
+                    HStack(spacing: 8) {
+                        Label("Live Captions (not saved)", systemImage: "captions.bubble").font(.caption.weight(.semibold))
+                            .help("Live Captions only show text on screen. Nothing is kept when they stop.")
+                        Spacer(minLength: 4)
+                        Button("Save as meeting") { state.keepLiveCaptions() }
+                            .buttonStyle(.glassProminent).controlSize(.small)
+                            .help("Keep this session: it's saved to Meetings when it stops")
+                    }
+                    .padding(8)
+                    .background(.orange.opacity(0.15), in: RoundedRectangle(cornerRadius: 6))
+                }
+            }
+            if m.selfMuted {
+                Label("Muted — your mic isn't recorded", systemImage: "mic.slash.fill")
+                    .font(.caption.weight(.semibold)).foregroundStyle(.orange)
+                    .padding(compact ? 0 : 8).frame(maxWidth: .infinity, alignment: .leading)
+                    .background(compact ? .clear : .orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+            }
         }
     }
 }

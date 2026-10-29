@@ -18,7 +18,15 @@ MCP server let your other apps and agents use the transcripts.
   meeting app, including Google Meet in a browser. The other participants (the app's audio) and you (the mic) are
   captured as separate tracks, so you are always labelled correctly.
 - **Speaker names.** Other participants are separated into Speaker 1, 2, … and, with captions on in Google Meet,
-  named after the people in the call. Voices you name once are recognised in later meetings.
+  named after the people in the call. Voices you name once are recognised in later meetings. Each speaker's turn is
+  one paragraph, not a new line at every pause.
+- **Knows the room (Google Meet).** Earshot reads Meet's page the way a screen reader does: the meeting title and
+  link, who is in the call (guests and other notetaker bots marked), when people join, leave and present, chat
+  messages, and the language of Meet's captions. That tells it how many speakers to look for, who said what, and
+  which speech engine to use. The matching calendar event adds attendees and the agenda. All of it is saved with
+  the meeting and shown in a Meeting tab with a clickable timeline.
+- **Respects mute.** While you're muted in Meet, your microphone isn't recorded: Earshot writes silence instead, so
+  side conversations never reach the transcript. When you leave the call, recording stops right away.
 - **Two speech engines.** English runs on Parakeet, which is fast and light. Pick another language (Romanian,
   German, Spanish, …) and Earshot switches to Whisper large-v3-turbo with that language forced, which handles
   accents, names and mixed-in English far better.
@@ -94,16 +102,18 @@ To uninstall, delete the app and, if you want to remove your data as well,
 
 ## Using it with Google Meet
 
-1. Pick the meeting's language in the toolbar first. English or Auto Detect uses Parakeet; any other language uses
-   Whisper, which downloads once (1.6 GB).
-2. Join the call in your browser. Earshot shows **Meeting detected**. Click **Transcribe**, or pick
-   "Record automatically" in Settings → Record Meetings.
-3. Turn on **captions (CC)** in Meet if you want real names instead of Speaker 1, 2, …. Earshot only uses the
-   captions to see who is speaking. The transcript text comes from its own model.
+1. Grant **Accessibility** once (Settings → Note Taker → Grant Access). Earshot needs it to read Meet's page: who is
+   in the call, captions, mute state and the end screen.
+2. Join the call in your browser (Chrome, Dia, Arc, Edge, Brave, Vivaldi). Earshot shows **Meeting detected**.
+   Click **Transcribe**, or pick "Record automatically" in Settings → Record Meetings. **Live Captions** only shows
+   text; during a call it's saved as a meeting too, unless you turn that off in Settings.
+3. Turn on **captions (CC)** in Meet for real names instead of Speaker 1, 2, …. Earshot only uses the captions to
+   see who is speaking, and their language to pick the engine (English → Parakeet, anything else → Whisper, which
+   downloads once, 1.6 GB). The transcript text comes from its own model.
 4. Use headphones or AirPods if you can. Echo cancellation helps on laptop speakers, but headphones give the
    cleanest audio.
-5. Leave the call. Earshot stops 10 seconds later, saves the transcript and replaces it with the polished version
-   about a minute later.
+5. Leave the call. Earshot stops as soon as Meet shows its end screen, saves the transcript and replaces it with
+   the polished version shortly after.
 
 macOS gives one audio stream for the whole browser, so a video playing in another tab of the same browser ends up
 in the transcript. Run Meet in a different browser from the one you use for media.
@@ -213,13 +223,14 @@ The OpenAI SDKs work with `base_url="http://127.0.0.1:7788/v1"` and the token as
 
 | Method & path | What |
 |---|---|
-| `GET /v1/events[?filter=meeting.,job.]` | Server-Sent Events: `meeting.detected`, `meeting.started`, `meeting.partial`, `meeting.segment`, `meeting.speakers_revised`, `meeting.note`, `meeting.warning`, `meeting.capture_restarted`, `meeting.ended_detected`, `meeting.resumed_after_sleep`, `meeting.saved`, `meeting.polishing`, `meeting.finalized`, `meeting.retranscribed`, `meeting.recovered`, `audio.tap_fallback`, `audio.echo_cancellation_bypassed`, `job.done`, `job.failed`. `filter` takes prefixes (`meeting.`) or `*` |
-| `GET /v1/meetings/current[?format=text]` | The running meeting's live transcript, notes and warnings |
+| `GET /v1/events[?filter=meeting.,job.]` | Server-Sent Events: `meeting.detected`, `meeting.started`, `meeting.partial`, `meeting.segment`, `meeting.speakers_revised`, `meeting.note`, `meeting.warning`, `meeting.capture_restarted`, `meeting.ended_detected`, `meeting.resumed_after_sleep`, `meeting.saved`, `meeting.polishing`, `meeting.finalized`, `meeting.retranscribed`, `meeting.recovered`, `meeting.kept`, `meeting.mic_muted`, `meeting.mic_unmuted`, `audio.tap_fallback`, `audio.echo_cancellation_bypassed`, `job.done`, `job.failed`. `filter` takes prefixes (`meeting.`) or `*` |
+| `GET /v1/meetings/current[?format=text]` | The running meeting's live transcript, notes, warnings, `context`, `self_muted`, `live_captions` and `saved` |
+| `POST /v1/meetings/current/keep` | Save the running Live Captions as a meeting |
 | `POST /v1/meetings/current/notes` `{"text"}` · `POST /v1/meetings/current/bookmark` | Add a note or bookmark now |
 | `GET /v1/meetings/detected` | The app currently detected as being in a call |
 | `POST /v1/meetings/start` `{"app"?: bundle id or "system", "title"?, "mic"?: true}` | Start recording (defaults to the detected app) |
 | `POST /v1/meetings/stop` | Stop and save. Returns the live transcript; `polishing` says whether a final version follows as `meeting.finalized` |
-| `GET /v1/meetings` | Saved meetings |
+| `GET /v1/meetings` | Saved meetings, with `participants`, `meeting_code`, `meeting_url` and `platform` |
 | `POST /v1/meetings/{id}/retranscribe` | Re-transcribe both recordings at full quality |
 
 ### Models, settings, dictation
@@ -228,8 +239,13 @@ The OpenAI SDKs work with `base_url="http://127.0.0.1:7788/v1"` and the token as
 |---|---|
 | `GET /v1/models` | Every model with `installed`, `bytes_on_disk`, `download_bytes`, `path` |
 | `POST /v1/models/download` `{"model"}` · `DELETE /v1/models/{id}` | Download or remove `parakeet-tdt-v3`, `whisper-large-v3-turbo`, `speaker-diarization`, `localvqe`, `parakeet-ctc-110m` |
-| `GET` / `PATCH /v1/settings` | `meeting_mode` (`ask`, `auto`, `off`), `meeting_apps`, `auto_stop_after_meeting`, `auto_dismiss_meeting_alerts`, `diarize_meetings`, `diarize_files`, `participants_name`, `my_name`, `echo_cancellation`, `language`, `watched_folders`, `polish_after_meeting`, `auto_name_speakers`, `remember_voices`, `vocabulary`, `bookmark_hotkey`, `audio_warnings`, `webhooks`, `webhook_events`, `auto_export_folder`, `auto_export_formats` |
+| `GET` / `PATCH /v1/settings` | `meeting_mode` (`ask`, `auto`, `off`), `meeting_apps`, `auto_stop_after_meeting`, `auto_dismiss_meeting_alerts`, `diarize_meetings`, `diarize_files`, `participants_name`, `my_name`, `echo_cancellation`, `language`, `watched_folders`, `polish_after_meeting`, `auto_name_speakers`, `remember_voices`, `vocabulary`, `bookmark_hotkey`, `audio_warnings`, `webhooks`, `webhook_events`, `auto_export_folder`, `auto_export_formats`, `follow_meeting_language`, `respect_mute`, `keep_live_captions_of_calls`, `txt_header` |
 | `GET /v1/dictation` · `POST /v1/dictation/start` · `stop` · `cancel` | Microphone dictation; `stop` returns the transcript |
+
+A saved meeting's verbose JSON (and its webhooks) carries a `context` object: `platform`, `meeting_code`, `url`,
+`title`, `calendar` (event, organizer, notes, attendees), `caption_language`, `participants` (`name`, `email`,
+`external`, `bot`, `is_self`, `presentation`, `joined_at`, `left_at`), `events` (`t`, `kind`, `who`, `text`) and
+`self_muted` intervals. The `text` field has one paragraph per speaker turn, separated by blank lines.
 
 `language` takes an ISO 639-1 code or `auto`; anything other than `en` or `auto` is transcribed with Whisper. The
 OpenAI `model` field can force an engine (`parakeet-tdt-v3` or `whisper-large-v3-turbo`); other values are
@@ -251,7 +267,8 @@ The app bundle includes an MCP server that lets Claude and other agents search a
 claude mcp add earshot -- /Applications/Earshot.app/Contents/MacOS/earshot-mcp
 ```
 
-Tools: `search_transcripts`, `list_meetings`, `get_transcript`, `current_meeting`, `start_meeting`, `stop_meeting`,
+Transcripts come with the room and participant list, so "what did the guest from Acme ask?" works. Tools:
+`search_transcripts`, `list_meetings`, `get_transcript`, `current_meeting`, `start_meeting`, `stop_meeting`,
 `add_meeting_note`, `transcribe_file`. Earshot must be running.
 
 ### URL scheme
@@ -266,7 +283,8 @@ added while Earshot was closed are picked up at the next launch.
 
 ## Build from source
 
-You need macOS 26, Apple silicon and Xcode 26 (Swift 6.2).
+You need macOS 26, Apple silicon and Xcode 26 or later (Swift 6.2). Xcode's `actool` compiles the app icon; without
+it the build falls back to a plain `.icns`.
 
 ```sh
 git clone https://github.com/vladt99/earshot.git
@@ -301,7 +319,9 @@ Sources/Earshot/
   MeetingDetector.swift  call detection, calendar titles
   Meeting.swift          meeting sessions, live transcription, live speakers, notes, watchdog, final pass
   Notetaker.swift        crash recovery, speaker naming (captions, voices), bookmark hotkey
-  MeetCaptions.swift     Google Meet captions through the accessibility tree
+  MeetObserver.swift     Google Meet through the accessibility tree: room, people, captions, mute, chat, end
+  MeetingContext.swift   the meeting context saved with each meeting
+  UI/MeetingInfo.swift   Meeting tab: room, calendar, participants, timeline
   AudioCapture.swift     Core Audio process tap, ring buffer, gap filling, microphone
   Engine.swift           engine routing; FluidAudio: Parakeet, diarization, custom vocabulary
   Whisper.swift          WhisperKit: Whisper large-v3-turbo, hallucination guard
@@ -329,19 +349,28 @@ Sources/EarshotMCP/main.swift   MCP server (stdio) over the local API
   confirmed once consecutive passes agree on it. With Whisper, a pass runs about every 2 seconds over the last 20
   seconds, and silence, repetition loops and the usual "thanks for watching" hallucinations are dropped. Speakers on the app track come from pyannote, re-run as the
   recording grows.
-- **Final pass.** After the call, both recordings are transcribed in full. Speakers are named from Meet caption
-  hints and remembered voices, and custom vocabulary is applied.
+- **Meeting context.** For Google Meet, Earshot reads the call page through the accessibility tree (no extension, no
+  network): participants, captions with speaker names, mute states, presenting, chat and the end screen. The roster
+  bounds how many voices the diarizer may find; caption turns, shifted by their measured lag, name each voice; a
+  participant who is muted can't be the one talking.
+- **Final pass.** After the call, both recordings are transcribed in full. Short speaker flips are smoothed out,
+  each sentence goes to one speaker, near-identical voices are merged, and speakers are named from Meet captions,
+  then remembered voices. Custom vocabulary is applied.
 
 ## Status and known limitations
 
-Earshot is young (0.9). What has been tested and what hasn't:
+Earshot is young (0.10). What has been tested and what hasn't:
 
 - Tested: call detection, live and final transcription in English and Romanian, AirPods in call mode, speaker
-  separation, remembered voices, bookmarks and notes, crash recovery, search, export, webhooks, the API and the MCP
+  separation, naming speakers from Meet captions on a recorded 40-minute call (96 % agreement with Meet's own
+  captions), remembered voices, bookmarks and notes, crash recovery, search, export, webhooks, the API and the MCP
   server.
-- Not yet tested in real calls: a full call with live Whisper, naming speakers from Google Meet captions (it depends
-  on Meet's page structure, which Google can change), FaceTime, switching audio devices mid-call, and the
-  silent-input warnings. Reports are welcome.
+- Not yet tested in a live call: not recording the mic while muted, stopping at Meet's end screen, switching the
+  engine to Meet's caption language, live names, a full call with live Whisper, FaceTime, switching audio devices
+  mid-call, and the silent-input warnings. Reports are welcome.
+- Meet support depends on Meet's page labels, which Google can change. English is verified; other Meet interface
+  languages are best guesses.
+- Only people who get captions can be named; others stay Speaker N until you name them once.
 - Live speaker labels can change during the first minute while the model learns the voices. The final pass is more
   accurate.
 - On laptop speakers without headphones, some of the other side can still reach your microphone track.

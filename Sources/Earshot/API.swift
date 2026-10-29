@@ -160,6 +160,14 @@ enum API {
                 // The live transcript; the polished one follows as `meeting.finalized` (SSE/webhook).
                 d["polishing"] = Settings.polishAfterMeeting
                 return .json(d)
+            case ("POST", ["v1", "meetings", "current", "keep"]):
+                // Live Captions → saved as a meeting when they stop.
+                let m = try await MainActor.run { () throws -> MeetingSnapshot in
+                    guard let m = AppState.shared.meeting else { throw APIError(409, "No meeting in progress") }
+                    AppState.shared.keepLiveCaptions()
+                    return m
+                }
+                return .json(["id": m.id, "live_captions": m.isLiveCaptions, "saved": true])
             case ("POST", ["v1", "meetings", "current", "bookmark"]), ("POST", ["v1", "meetings", "current", "notes"]):
                 let body = req.jsonObject
                 let kind = parts[3] == "bookmark" ? "bookmark" : "note"
@@ -296,6 +304,10 @@ enum API {
         d["notes"] = m.notes.map(Formats.note)
         d["warning"] = m.warning ?? NSNull()
         d["reading_captions"] = m.readingCaptions
+        d["self_muted"] = m.selfMuted
+        d["live_captions"] = m.isLiveCaptions
+        d["saved"] = await MainActor.run { AppState.shared.willSave(m) }
+        d["context"] = m.context.map { Formats.context($0) } ?? NSNull()
         return .json(d)
     }
 
@@ -456,6 +468,10 @@ enum SettingsAPI {
             "copy_dictation_to_clipboard": Settings.copyDictationToClipboard,
             "watched_folders": Settings.watchedFolders,
             "polish_after_meeting": Settings.polishAfterMeeting,
+            "follow_meeting_language": Settings.followMeetingLanguage,
+            "respect_mute": Settings.respectMute,
+            "keep_live_captions_of_calls": Settings.keepLiveCaptionsOfCalls,
+            "txt_header": Settings.txtHeader,
             "auto_name_speakers": Settings.autoNameSpeakers,
             "remember_voices": Settings.rememberVoices,
             "vocabulary": Settings.vocabulary,
@@ -486,6 +502,10 @@ enum SettingsAPI {
         if let v = b["use_calendar_titles"] as? Bool { Settings.useCalendarTitles = v }
         if let v = b["copy_dictation_to_clipboard"] as? Bool { Settings.copyDictationToClipboard = v }
         if let v = b["polish_after_meeting"] as? Bool { Settings.polishAfterMeeting = v }
+        if let v = b["follow_meeting_language"] as? Bool { Settings.followMeetingLanguage = v }
+        if let v = b["respect_mute"] as? Bool { Settings.respectMute = v }
+        if let v = b["keep_live_captions_of_calls"] as? Bool { Settings.keepLiveCaptionsOfCalls = v }
+        if let v = b["txt_header"] as? Bool { Settings.txtHeader = v }
         if let v = b["auto_name_speakers"] as? Bool { Settings.autoNameSpeakers = v }
         if let v = b["remember_voices"] as? Bool { Settings.rememberVoices = v }
         if let v = b["audio_warnings"] as? Bool { Settings.audioWarnings = v }

@@ -98,6 +98,24 @@ enum Settings {
 
     // MARK: Note taker
 
+    /// Use the meeting app's caption language (Google Meet) instead of the language picked in Earshot.
+    static var followMeetingLanguage: Bool {
+        get { d.object(forKey: "followMeetingLanguage") as? Bool ?? true }
+        set { d.set(newValue, forKey: "followMeetingLanguage") }
+    }
+
+    /// Write silence instead of your microphone while you're muted in the meeting app.
+    static var respectMute: Bool {
+        get { d.object(forKey: "respectMute") as? Bool ?? true }
+        set { d.set(newValue, forKey: "respectMute") }
+    }
+
+    /// Live Captions of a detected call are saved as a meeting when they stop.
+    static var keepLiveCaptionsOfCalls: Bool {
+        get { d.object(forKey: "keepLiveCaptionsOfCalls") as? Bool ?? true }
+        set { d.set(newValue, forKey: "keepLiveCaptionsOfCalls") }
+    }
+
     /// After Stop, re-transcribe both recordings in one clean pass (better text and speakers than the live
     /// version).
     static var polishAfterMeeting: Bool {
@@ -174,6 +192,12 @@ enum Settings {
     static var autoExportFolder: String? {
         get { d.string(forKey: "autoExportFolder") }
         set { d.set(newValue, forKey: "autoExportFolder") }
+    }
+
+    /// TXT exports start with the title, date and participants.
+    static var txtHeader: Bool {
+        get { d.object(forKey: "txtHeader") as? Bool ?? true }
+        set { d.set(newValue, forKey: "txtHeader") }
     }
 
     static var autoExportFormats: [String] {

@@ -48,6 +48,8 @@ final class Store: @unchecked Sendable {
         // v0.7: meeting notes, remembered voices, full-text search
         exec("ALTER TABLE transcripts ADD COLUMN notes TEXT")
         exec("CREATE TABLE IF NOT EXISTS voices (name TEXT PRIMARY KEY, embedding TEXT NOT NULL, samples INTEGER NOT NULL DEFAULT 1)")
+        // v0.10: meeting context (room, calendar event, participants, events) as JSON
+        exec("ALTER TABLE transcripts ADD COLUMN context TEXT")
         exec("CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(id UNINDEXED, title, body, tokenize = 'unicode61 remove_diacritics 2')")
         exec("""
         INSERT INTO search (id, title, body)
@@ -61,7 +63,7 @@ final class Store: @unchecked Sendable {
     func insert(_ t: Transcript) -> Bool {
         lock.lock(); defer { lock.unlock() }
         return transaction {
-            let sql = "INSERT OR REPLACE INTO transcripts (id, created, title, source_path, origin, model, language, duration, processing, text, segments, deleted, folder, ai, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            let sql = "INSERT OR REPLACE INTO transcripts (id, created, title, source_path, origin, model, language, duration, processing, text, segments, deleted, folder, ai, notes, context) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             var st: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { return false }
             defer { sqlite3_finalize(st) }
@@ -81,20 +83,22 @@ final class Store: @unchecked Sendable {
             bind(st, 13, t.folderID)
             sqlite3_bind_null(st, 14)
             bind(st, 15, t.notes.flatMap { try? encoder.encode($0) }.flatMap { String(data: $0, encoding: .utf8) })
+            bind(st, 16, encoded(t.context))
             return step(st) && index(t)
         }
     }
 
-    /// Replaces only the content of an existing row (never recreates a deleted one). nil arguments keep the stored value.
+    /// Replaces only the content of an existing row (never recreates a deleted one). nil arguments keep the stored value,
+    /// so notes and the meeting context survive a re-transcription.
     @discardableResult
     func updateContent(id: String, segments: [Segment], text: String, model: String? = nil, processingSeconds: Double? = nil,
-                       duration: Double? = nil, language: String? = nil) -> Bool {
+                       duration: Double? = nil, language: String? = nil, context: MeetingContext? = nil) -> Bool {
         guard let json = (try? encoder.encode(segments)).flatMap({ String(data: $0, encoding: .utf8) }) else { return false }
         lock.lock(); defer { lock.unlock() }
         return transaction {
             let sql = """
             UPDATE transcripts SET segments = ?1, text = ?2, model = COALESCE(?3, model), processing = COALESCE(?4, processing),
-                duration = COALESCE(?5, duration), language = COALESCE(?6, language) WHERE id = ?7
+                duration = COALESCE(?5, duration), language = COALESCE(?6, language), context = COALESCE(?8, context) WHERE id = ?7
             """
             var st: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { return false }
@@ -106,16 +110,40 @@ final class Store: @unchecked Sendable {
             if let duration { sqlite3_bind_double(st, 5, duration) } else { sqlite3_bind_null(st, 5) }
             bind(st, 6, language)
             bind(st, 7, id)
+            bind(st, 8, encoded(context))
             guard step(st), sqlite3_changes(db) > 0, let t = getLocked(id) else { return false }
             return index(t)
         }
     }
 
-    /// Keeps the full-text index in step with the row (caller holds the lock).
+    /// Sets the meeting context of a stored transcript (nil clears it).
+    @discardableResult
+    func setContext(_ id: String, _ context: MeetingContext?) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return transaction {
+            guard runLocked("UPDATE transcripts SET context = ? WHERE id = ?", [encoded(context), id]), sqlite3_changes(db) > 0,
+                  let t = getLocked(id) else { return false }
+            return index(t)
+        }
+    }
+
+    /// Keeps the full-text index in step with the row (caller holds the lock). The meeting and calendar titles count
+    /// as title words; participant names and chat as body, so "Maya" finds the meetings she attended.
     private func index(_ t: Transcript) -> Bool {
         let notes = (t.notes ?? []).map(\.text).joined(separator: " ")
+        let c = t.context
+        let titles = [c?.title, c?.calendar?.title].compactMap { $0 }.filter { $0 != t.title && !$0.isEmpty }
+        var extra = (c?.participants ?? []).map(\.name) + (c?.calendar?.attendees ?? []).compactMap(\.name)
+        extra += Formats.chats(c).compactMap(\.text)
+        if let code = c?.meetingCode { extra.append(code) }
+        let title = ([t.title] + titles).joined(separator: " ")
+        let body = ([t.text, notes] + extra).filter { !$0.isEmpty }.joined(separator: " ")
         return runLocked("DELETE FROM search WHERE id = ?", [t.id])
-            && runLocked("INSERT INTO search (id, title, body) VALUES (?, ?, ?)", [t.id, t.title, t.text + " " + notes])
+            && runLocked("INSERT INTO search (id, title, body) VALUES (?, ?, ?)", [t.id, title, body])
+    }
+
+    private func encoded<T: Encodable>(_ value: T?) -> String? {
+        value.flatMap { try? encoder.encode($0) }.flatMap { String(data: $0, encoding: .utf8) }
     }
 
     /// `limit` nil = everything (the app's own library); the API passes its page size.
@@ -157,7 +185,7 @@ final class Store: @unchecked Sendable {
     @discardableResult
     func deleteTrashed() -> Int { purge("deleted IS NOT NULL", []) }
 
-    private static let columns = "id, created, title, source_path, origin, model, language, duration, processing, text, segments, deleted, folder, ai, notes"
+    private static let columns = "id, created, title, source_path, origin, model, language, duration, processing, text, segments, deleted, folder, ai, notes, context"
 
     // MARK: Search
 
@@ -203,7 +231,7 @@ final class Store: @unchecked Sendable {
             let lines = t.segments.filter { s in
                 terms.allSatisfy { s.text.range(of: $0, options: [.caseInsensitive, .diacriticInsensitive]) != nil }
             }
-            out.append(Hit(transcript: t, snippet: text(st, 15) ?? "", segments: Array(lines.prefix(5))))
+            out.append(Hit(transcript: t, snippet: text(st, 16) ?? "", segments: Array(lines.prefix(5))))
         }
         return out
     }
@@ -384,7 +412,8 @@ final class Store: @unchecked Sendable {
             segments: (try? decoder.decode([Segment].self, from: Data(segJSON.utf8))) ?? [],
             deletedAt: sqlite3_column_type(st, 11) == SQLITE_NULL ? nil : Date(timeIntervalSince1970: sqlite3_column_double(st, 11)),
             folderID: text(st, 12),
-            notes: text(st, 14).flatMap { try? decoder.decode([Note].self, from: Data($0.utf8)) }
+            notes: text(st, 14).flatMap { try? decoder.decode([Note].self, from: Data($0.utf8)) },
+            context: text(st, 15).flatMap { try? decoder.decode(MeetingContext.self, from: Data($0.utf8)) }
         )
     }
 

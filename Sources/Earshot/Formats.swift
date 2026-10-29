@@ -5,10 +5,10 @@ enum Formats {
 
     static func render(_ t: Transcript, as format: String) -> HTTPResponse {
         switch format {
-        case "text", "txt": return .text(t.text)
+        case "text", "txt": return .text(text(t))
         case "srt": return .text(srt(t), contentType: "application/x-subrip; charset=utf-8")
         case "vtt": return .text(vtt(t), contentType: "text/vtt; charset=utf-8")
-        case "json": return .json(["text": t.text])
+        case "json": return .json(["text": text(t)])
         default: return .json(verbose(t))
         }
     }
@@ -18,7 +18,7 @@ enum Formats {
         var d: [String: Any] = [
             "id": t.id,
             "task": "transcribe",
-            "text": t.text,
+            "text": text(t),
             "title": t.title,
             "model": t.model,
             "origin": t.origin,
@@ -35,7 +35,37 @@ enum Formats {
         d["duration"] = t.duration.map(num)
         d["source_path"] = t.sourcePath
         d["notes"] = (t.notes ?? []).map(note)
+        d["context"] = t.context.map { context($0) }
         return d
+    }
+
+    /// The transcript as speaker paragraphs (stored `text` for transcripts without segments).
+    static func text(_ t: Transcript) -> String { t.segments.isEmpty ? t.text : speakerText(t.segments) }
+
+    /// A meeting's room, calendar event, participants and events in snake_case. Caption turns are left out
+    /// (`captions: true` adds them): they are only used to name speakers.
+    static func context(_ c: MeetingContext, captions: Bool = false) -> [String: Any] {
+        let enc = JSONEncoder()
+        enc.keyEncodingStrategy = .convertToSnakeCase
+        enc.dateEncodingStrategy = .iso8601
+        guard let data = try? enc.encode(c), var d = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return [:] }
+        if !captions { d.removeValue(forKey: "captions") }
+        d["platform_name"] = platformName(c.platform)
+        return d
+    }
+
+    static func platformName(_ p: String?) -> String? {
+        guard let p, !p.isEmpty else { return nil }
+        return ["meet": "Google Meet", "google meet": "Google Meet", "zoom": "Zoom", "teams": "Microsoft Teams", "webex": "Webex",
+                "slack": "Slack", "facetime": "FaceTime"][p.lowercased()] ?? p
+    }
+
+    /// People shown in the call: everyone but presentation tiles.
+    static func people(_ c: MeetingContext?) -> [MeetingParticipant] { (c?.participants ?? []).filter { !$0.presentation } }
+
+    /// "Ana, Bob (guest), Fathom Notetaker (bot)"
+    static func peopleLine(_ c: MeetingContext?) -> String {
+        people(c).map { $0.name + ($0.bot ? " (bot)" : $0.external ? " (guest)" : "") }.joined(separator: ", ")
     }
 
     static func note(_ n: Note) -> [String: Any] {
@@ -43,27 +73,65 @@ enum Formats {
     }
 
     /// Meeting notes as Markdown for a notes app (Obsidian, Bear…): front matter, bookmarks and notes, then the
-    /// transcript as speaker paragraphs with timestamps.
+    /// transcript as speaker paragraphs with timestamps and the meeting chat in place.
     static func markdown(_ t: Transcript) -> String {
         let speakers = Array(Set(t.segments.compactMap(\.speaker))).sorted()
+        let c = t.context, people = people(c)
         var out = "---\n"
         out += "title: \(yaml(t.title))\n"
         out += "date: \(iso(t.createdAt))\n"
         if let d = t.duration { out += "duration: \(clock(d))\n" }
-        if !speakers.isEmpty { out += "participants: [\(speakers.map(yaml).joined(separator: ", "))]\n" }
+        if !people.isEmpty {
+            out += "participants: [\(people.map { yaml($0.name) }.joined(separator: ", "))]\n"
+            let guests = people.filter { $0.external && !$0.bot }, bots = people.filter(\.bot)
+            if !guests.isEmpty { out += "guests: [\(guests.map { yaml($0.name) }.joined(separator: ", "))]\n" }
+            if !bots.isEmpty { out += "bots: [\(bots.map { yaml($0.name) }.joined(separator: ", "))]\n" }
+            if !speakers.isEmpty { out += "speakers: [\(speakers.map(yaml).joined(separator: ", "))]\n" }
+        } else if !speakers.isEmpty {
+            out += "participants: [\(speakers.map(yaml).joined(separator: ", "))]\n"
+        }
+        if let p = platformName(c?.platform) { out += "platform: \(yaml(p))\n" }
+        if let code = c?.meetingCode { out += "meeting_code: \(yaml(code))\n" }
+        if let url = c?.url { out += "meeting_url: \(yaml(url))\n" }
+        if let title = c?.calendar?.title { out += "calendar_title: \(yaml(title))\n" }
+        if let organizer = c?.calendar?.organizer { out += "organizer: \(yaml(organizer))\n" }
         out += "source: earshot\nid: \(t.id)\n---\n\n# \(t.title)\n\n"
+        if let agenda = c?.calendar?.notes?.trimmingCharacters(in: .whitespacesAndNewlines), !agenda.isEmpty {
+            out += "## Agenda\n\n\(agenda)\n\n"
+        }
         let notes = (t.notes ?? []).sorted { $0.time < $1.time }
         if !notes.isEmpty {
             out += "## Notes\n\n" + notes.map { "- **\(clock($0.time))** \($0.kind == "bookmark" ? "🔖 " : "")\($0.text)" }.joined(separator: "\n") + "\n\n"
         }
         out += "## Transcript\n\n"
-        var paragraphs: [(String?, Double, String)] = []
-        for s in t.segments {
-            if let last = paragraphs.last, last.0 == s.speaker, s.start - last.1 < 120 { paragraphs[paragraphs.count - 1].2 += " " + s.text }
-            else { paragraphs.append((s.speaker, s.start, s.text)) }
+        let chat = chats(c)
+        var blocks: [(Double, String)] = paragraphs(t.segments, breaks: chat.map(\.t)).map { p in
+            (t.segments[p[0]].start, "**\(clock(t.segments[p[0]].start))**\(t.segments[p[0]].speaker.map { " **\($0):**" } ?? "") "
+                + p.map { t.segments[$0].text }.joined(separator: " "))
         }
-        out += paragraphs.map { who, start, text in "**\(clock(start))**\(who.map { " **\($0):**" } ?? "") \(text)" }.joined(separator: "\n\n")
+        blocks += chat.map { e in (e.t, "> **\(clock(e.t))** 💬 \(e.who.map { "**\($0):** " } ?? "")\(e.text ?? "")") }
+        out += blocks.enumerated().sorted { ($0.element.0, $0.offset) < ($1.element.0, $1.offset) }.map(\.element.1).joined(separator: "\n\n")
         return out + "\n"
+    }
+
+    /// Chat messages of a meeting, in time order.
+    static func chats(_ c: MeetingContext?) -> [MeetingEvent] {
+        (c?.events ?? []).filter { $0.kind == .chat && !($0.text ?? "").isEmpty }.sorted { $0.t < $1.t }
+    }
+
+    /// The TXT export: a short header (title, date, participants) above the speaker paragraphs.
+    static func plainText(_ t: Transcript, header: Bool = Settings.txtHeader) -> String {
+        let body = paragraphText(t.segments, fallback: t.text)
+        guard header else { return body }
+        var head = [t.title, t.createdAt.formatted(date: .abbreviated, time: .shortened) + (t.duration.map { " · " + clock($0) } ?? "")]
+        let names = peopleLine(t.context)
+        if !names.isEmpty {
+            head.append("Participants: " + names)
+        } else {
+            let speakers = Array(Set(t.segments.compactMap(\.speaker))).sorted()
+            if !speakers.isEmpty { head.append("Speakers: " + speakers.joined(separator: ", ")) }
+        }
+        return head.joined(separator: "\n") + "\n\n" + body + "\n"
     }
 
     /// YAML double-quoted scalar.
@@ -90,18 +158,67 @@ enum Formats {
         ]
         d["language"] = t.language
         d["duration"] = t.duration
+        if let c = t.context {
+            d["participants"] = people(c).map(\.name)
+            d["meeting_code"] = c.meetingCode
+            d["meeting_url"] = c.url
+            d["platform"] = platformName(c.platform)
+        }
         return d
     }
 
-    /// "Me: …\nSpeaker 1: …" with consecutive lines of the same speaker merged.
+    /// "Me: …\n\nSpeaker 1: …": one paragraph per speaker turn (see `paragraphs`). Without speakers, the plain
+    /// text on one line as before (dictation, OpenAI-style `text`).
     static func speakerText(_ segments: [Segment]) -> String {
         guard segments.contains(where: { $0.speaker != nil }) else { return segments.map(\.text).joined(separator: " ") }
-        var out: [(String, String)] = []
-        for s in segments {
-            let who = s.speaker ?? "Unknown"
-            if let last = out.last, last.0 == who { out[out.count - 1].1 += " " + s.text } else { out.append((who, s.text)) }
+        return paragraphText(segments)
+    }
+
+    /// Speaker paragraphs separated by blank lines, "Name: " in front when the transcript has speakers.
+    static func paragraphText(_ segments: [Segment], fallback: String = "") -> String {
+        guard !segments.isEmpty else { return fallback }
+        let named = segments.contains { $0.speaker != nil }
+        return paragraphs(segments).map { p in
+            let text = p.map { segments[$0].text.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }.joined(separator: " ")
+            return named ? "\(segments[p[0]].speaker ?? "Unknown"): \(text)" : text
+        }.joined(separator: "\n\n")
+    }
+
+    /// A pause longer than this starts a new paragraph even for the same speaker.
+    static let paragraphPause = 10.0
+    /// Past this length a paragraph ends at the next sentence end; `paragraphMax` ends it regardless.
+    static let paragraphLength = 120.0
+    static let paragraphMax = 180.0
+
+    /// Groups consecutive segments (indices into `segments`) into paragraphs: a new one starts when the speaker
+    /// changes, after a pause over 10 s, once a paragraph is ~2 min long and the previous segment ended a
+    /// sentence, or at any time in `breaks` (chat messages, notes).
+    static func paragraphs(_ segments: [Segment], breaks: [Double] = []) -> [[Int]] {
+        paragraphs(Array(segments.indices), breaks: breaks) { segments[$0] }
+    }
+
+    static func paragraphs<T>(_ items: [T], breaks: [Double] = [], segment: (T) -> Segment) -> [[T]] {
+        let breaks = breaks.sorted()
+        var out: [[T]] = []
+        var first: Segment?, last: Segment?
+        for item in items {
+            let s = segment(item)
+            if let f = first, let l = last, out.last != nil, l.speaker == s.speaker, s.start - l.end <= paragraphPause,
+               !(s.start - f.start >= paragraphLength && endsSentence(l.text)), s.start - f.start < paragraphMax,
+               !breaks.contains(where: { $0 > l.start && $0 <= s.start }) {
+                out[out.count - 1].append(item)
+            } else {
+                out.append([item])
+                first = s
+            }
+            last = s
         }
-        return out.map { "\($0.0): \($0.1)" }.joined(separator: "\n")
+        return out
+    }
+
+    static func endsSentence(_ text: String) -> Bool {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "\"'”’)»")))
+        return t.last.map { ".?!…。？！".contains($0) } ?? false
     }
 
     private static func label(_ s: Segment) -> String { s.speaker.map { "\($0): \(s.text)" } ?? s.text }

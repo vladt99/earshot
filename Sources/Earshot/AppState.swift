@@ -31,6 +31,8 @@ final class AppState {
     var polishing: Set<String> = []
     var serverRunning = false
     var serverError: String?
+    /// Live Captions sessions the user asked to keep ("Save as meeting").
+    var keptSessions: Set<String> = []
 
     // Main window
     var route: Route = .home
@@ -342,9 +344,15 @@ final class AppState {
         saveContent(current.id, segments)
     }
 
-    func toggleFavorite(_ t: Transcript, _ index: Int) {
-        guard var segments = Store.shared.get(t.id)?.segments, segments.indices.contains(index) else { return }
-        segments[index].favorite = !(segments[index].favorite ?? false)
+    func toggleFavorite(_ t: Transcript, _ index: Int) { toggleFavorite(t, [index]) }
+
+    /// Stars every segment of a paragraph, or unstars them all when they already are.
+    func toggleFavorite(_ t: Transcript, _ indices: [Int]) {
+        guard var segments = Store.shared.get(t.id)?.segments else { return }
+        let valid = indices.filter(segments.indices.contains)
+        guard !valid.isEmpty else { return }
+        let on = !valid.allSatisfy { segments[$0].favorite == true }
+        for i in valid { segments[i].favorite = on ? true : nil }
         saveContent(t.id, segments)
     }
 
@@ -492,6 +500,20 @@ final class AppState {
 
     func keepRecording() { MeetingController.shared.keepRecording() }
 
+    /// Turns the running Live Captions into a meeting that is saved when it stops.
+    func keepLiveCaptions() {
+        guard let m = meeting, m.isLiveCaptions else { return }
+        if MeetingController.shared.keepSession() { keptSessions.insert(m.id) }
+    }
+
+    /// Live Captions of a call that will be saved anyway (`keepLiveCaptionsOfCalls`).
+    func keptAutomatically(_ m: MeetingSnapshot) -> Bool {
+        m.isLiveCaptions && Settings.keepLiveCaptionsOfCalls && (m.context != nil || detectedMeeting != nil)
+    }
+
+    /// The running session ends up in the library: a recording, or Live Captions that are being kept.
+    func willSave(_ m: MeetingSnapshot) -> Bool { !m.isLiveCaptions || m.kept || keptSessions.contains(m.id) || keptAutomatically(m) }
+
     func retranscribe(_ t: Transcript) {
         Task {
             do { _ = try await MeetingController.shared.retranscribe(t.id) } catch {
@@ -541,4 +563,10 @@ final class AppState {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(s, forType: .string)
     }
+}
+
+extension MeetingSnapshot {
+    /// Live Captions: transcribed on screen, not saved unless kept.
+    var isLiveCaptions: Bool { platform == "Live Captions" }
+    var people: [MeetingParticipant] { Formats.people(context) }
 }

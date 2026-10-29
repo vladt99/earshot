@@ -308,6 +308,10 @@ private struct SettingsPage: View {
                 }
                 note("Every finished transcript is also written to this folder in the selected formats.")
             }
+            GlassGroup {
+                toggle("Start TXT files with the title, date and participants", Settings.txtHeader) { Settings.txtHeader = $0 }
+                note("Text and Markdown keep each speaker's turn in one paragraph; a new one starts when the speaker changes, after a pause of more than 10 seconds, or after about two minutes.")
+            }
         case "Batch Export":
             GlassGroup {
                 note("Export every transcript in your library at once: pick the formats, then a folder. One file per transcript and format.")
@@ -393,6 +397,14 @@ private struct MeetingSettings: View {
                     .frame(width: 220)
             }
         }
+        GlassGroup(title: "During calls") {
+            row("Use the meeting's caption language", Settings.followMeetingLanguage) { Settings.followMeetingLanguage = $0 }
+            explain("When Google Meet's captions are set to another language, the meeting is transcribed in that language instead of the one picked in Earshot.")
+            row("Don't record my microphone while I'm muted", Settings.respectMute) { Settings.respectMute = $0 }
+            explain("While you're muted in the meeting app, silence is recorded instead of your microphone, so side conversations stay out of the transcript.")
+            row("Save Live Captions of calls as meetings", Settings.keepLiveCaptionsOfCalls) { Settings.keepLiveCaptionsOfCalls = $0 }
+            explain("Live Captions started during a call are saved to Meetings when they stop. Other Live Captions are never saved unless you click Save as meeting.")
+        }
         GlassGroup(title: "Apps to observe") {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 180))], alignment: .leading, spacing: 8) {
                 ForEach(MeetingApp.known, id: \.bundleID) { app in
@@ -413,6 +425,10 @@ private struct MeetingSettings: View {
 
     private func row(_ title: String, _ value: Bool, _ set: @escaping (Bool) -> Void) -> some View {
         SwitchRow(title: title, isOn: Binding(get: { value }, set: { set($0); tick += 1 }))
+    }
+
+    private func explain(_ text: String) -> some View {
+        Text(text).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true).padding(.top, -8)
     }
 }
 

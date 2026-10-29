@@ -216,7 +216,7 @@ final class SampleSink: @unchecked Sendable {
             mismatch = rateCheck.measure(host: hostTime, index: received, assumed: Self.rate)
             if let origin = _origin {
                 let wall = Int((HostTime.seconds(from: origin, to: hostTime) * Self.rate).rounded())
-                let written = base + samples.count
+                let written = base + samples.count + pending.count
                 var exact = written == 0
                 if let wake = resyncAt {
                     resyncAt = nil
@@ -246,7 +246,37 @@ final class SampleSink: @unchecked Sendable {
         }
     }
 
+    /// Mic track of a meeting that reports mute: samples wait this long before reaching the buffer and the file,
+    /// so muting also blanks the moment before the mute was noticed.
+    private var holdback = 0
+    private var pending: [Float] = []
+    private var muted = false
+
+    func hold(seconds: Double) { lock.withLock { holdback = Int(seconds * Self.rate) } }
+
+    /// Muted: zeros instead of samples from now on, held-back samples included. The timeline keeps its length.
+    func gate(muted: Bool) {
+        lock.withLock {
+            self.muted = muted
+            if muted, !pending.isEmpty { vDSP_vclr(&pending, 1, vDSP_Length(pending.count)) }
+        }
+    }
+
     private func write(_ p: UnsafePointer<Float>, count: Int) {
+        guard holdback > 0 || muted || !pending.isEmpty else { return commit(p, count: count) }
+        if muted { pending.append(contentsOf: repeatElement(0, count: count)) }
+        else { pending.append(contentsOf: UnsafeBufferPointer(start: p, count: count)) }
+        release(keeping: holdback)
+    }
+
+    private func release(keeping n: Int) {
+        let k = pending.count - n
+        guard k > 0 else { return }
+        pending.withUnsafeBufferPointer { commit($0.baseAddress!, count: k) }
+        pending.removeFirst(k)
+    }
+
+    private func commit(_ p: UnsafePointer<Float>, count: Int) {
         samples.append(contentsOf: UnsafeBufferPointer(start: p, count: count))
         guard let file, let dst = scratch.floatChannelData?[0] else { return }
         var done = 0
@@ -260,6 +290,10 @@ final class SampleSink: @unchecked Sendable {
     }
 
     private func writeSilence(_ count: Int) {
+        guard holdback == 0, pending.isEmpty else {
+            pending.append(contentsOf: repeatElement(0, count: count))
+            return release(keeping: holdback)
+        }
         samples.append(contentsOf: repeatElement(0, count: count))
         guard let file, let dst = scratch.floatChannelData?[0] else { return }
         dst.update(repeating: 0, count: Int(scratch.frameCapacity))
@@ -311,7 +345,10 @@ final class SampleSink: @unchecked Sendable {
     }
 
     func close() {
-        lock.withLock { file = nil }
+        lock.withLock {
+            release(keeping: 0)
+            file = nil
+        }
     }
 }
 

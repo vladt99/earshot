@@ -1,3 +1,4 @@
+import CoreML
 import Foundation
 import NaturalLanguage
 import WhisperKit
@@ -142,6 +143,54 @@ enum WhisperSupport {
                 let joined = i > 0 && !w.word.hasPrefix(" ") && !out.isEmpty
                 let start = min(Double(w.start), duration)
                 out.append(LiveWord(text: (joined ? "" : " ") + text, start: start, end: min(max(Double(w.end), start), duration)))
+            }
+        }
+        return out
+    }
+}
+
+/// WhisperKit times words from the decoder's attention rows counted from the transcript's first token, but with a
+/// prompt (custom vocabulary) those rows begin with the prompt: each word got the timing of the token a prompt's
+/// length before it (≈ 1.9 s early), and the first words of every window all landed at 0.00. The rows are shifted
+/// past the prompt before WhisperKit aligns them.
+final class PromptAlignedSeeker: SegmentSeeking {
+    private let inner = SegmentSeeker()
+
+    func findSeekPointAndSegments(decodingResult: DecodingResult, options: DecodingOptions, allSegmentsCount: Int, currentSeek seek: Int,
+                                  segmentSize: Int, sampleRate: Int, timeToken: Int, specialToken: Int,
+                                  tokenizer: WhisperTokenizer) -> (Int, [TranscriptionSegment]?) {
+        inner.findSeekPointAndSegments(decodingResult: decodingResult, options: options, allSegmentsCount: allSegmentsCount, currentSeek: seek,
+                                       segmentSize: segmentSize, sampleRate: sampleRate, timeToken: timeToken, specialToken: specialToken,
+                                       tokenizer: tokenizer)
+    }
+
+    func addWordTimestamps(segments: [TranscriptionSegment], alignmentWeights: MLMultiArray, tokenizer: WhisperTokenizer, seek: Int,
+                           segmentSize: Int, prependPunctuations: String, appendPunctuations: String, lastSpeechTimestamp: Float,
+                           options: DecodingOptions, timings: TranscriptionTimings) throws -> [TranscriptionSegment]? {
+        let rows = Self.promptRows(options, tokenizer: tokenizer)
+        return try inner.addWordTimestamps(segments: segments, alignmentWeights: rows > 0 ? try Self.drop(rows, of: alignmentWeights) : alignmentWeights,
+                                           tokenizer: tokenizer, seek: seek, segmentSize: segmentSize, prependPunctuations: prependPunctuations,
+                                           appendPunctuations: appendPunctuations, lastSpeechTimestamp: lastSpeechTimestamp,
+                                           options: options, timings: timings)
+    }
+
+    /// Rows the prompt adds ahead of the transcript, as WhisperKit trims it. Measured against Parakeet's timings
+    /// (four 25 s clips): shifting by the prompt's length leaves words 0.1–0.2 s late on average; one row more, 0.4–0.5 s.
+    static func promptRows(_ options: DecodingOptions, tokenizer: WhisperTokenizer) -> Int {
+        guard options.usePrefillPrompt, let prompt = options.promptTokens else { return 0 }
+        return prompt.suffix(Constants.maxTokenContext / 2 - 1).filter { $0 < tokenizer.specialTokens.specialTokenBegin }.count
+    }
+
+    static func drop(_ rows: Int, of weights: MLMultiArray) throws -> MLMultiArray {
+        let shape = weights.shape.map(\.intValue)
+        guard shape.count >= 2, let columns = shape.last, rows < shape[shape.count - 2] else { return weights }
+        let out = try MLMultiArray(shape: weights.shape, dataType: weights.dataType)
+        let total = shape.reduce(1, *)
+        weights.withUnsafeBytes { src in
+            out.withUnsafeMutableBytes { dst, _ in
+                let size = src.count / total, skip = rows * columns * size
+                memset(dst.baseAddress!, 0, dst.count)
+                memcpy(dst.baseAddress!, src.baseAddress!.advanced(by: skip), src.count - skip)
             }
         }
         return out

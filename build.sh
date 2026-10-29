@@ -20,7 +20,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN/Earshot" "$APP/Contents/MacOS/Earshot"
 cp "$BIN/earshot-mcp" "$APP/Contents/MacOS/earshot-mcp"
 cp Info.plist "$APP/Contents/Info.plist"
-# App icon: Resources/AppIcon.png (1024×1024) → AppIcon.icns
+# App icon: Resources/AppIcon.png (1024×1024, full bleed: macOS applies its own mask) → AppIcon.icns, the fallback
 if [[ -f Resources/AppIcon.png ]]; then
   SET=$(mktemp -d)/AppIcon.iconset
   mkdir -p "$SET"
@@ -29,6 +29,18 @@ if [[ -f Resources/AppIcon.png ]]; then
     sips -z $((size * 2)) $((size * 2)) Resources/AppIcon.png --out "$SET/icon_${size}x${size}@2x.png" >/dev/null
   done
   iconutil -c icns "$SET" -o "$APP/Contents/Resources/AppIcon.icns"
+fi
+# Asset catalog (CFBundleIconName): without it macOS 26 shows the icon shrunk on a grey rounded square. Needs Xcode.
+if [[ -d Resources/Assets.xcassets ]]; then
+  CAR=$(mktemp -d)
+  if xcrun actool Resources/Assets.xcassets --compile "$CAR" --platform macosx --minimum-deployment-target 26.0 \
+       --app-icon AppIcon --output-partial-info-plist "$CAR/partial.plist" >/dev/null; then
+    cp "$CAR/Assets.car" "$APP/Contents/Resources/"
+    [[ -f $CAR/AppIcon.icns ]] && cp "$CAR/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+  else
+    echo "warning: actool failed (is Xcode installed?); using AppIcon.icns only" >&2
+  fi
+  rm -rf "$CAR"
 fi
 # SwiftPM resource bundles of dependencies
 for b in "$BIN"/*.bundle(N); do cp -R "$b" "$APP/Contents/Resources/"; done

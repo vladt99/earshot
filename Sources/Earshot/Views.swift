@@ -77,12 +77,16 @@ struct MeetingMenuSection: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             if let m = state.meeting {
+                let saved = state.willSave(m)
                 HStack {
-                    Circle().fill(.red).frame(width: 8, height: 8)
-                    Text(m.title).font(.callout.bold()).lineLimit(1)
+                    if saved { Circle().fill(.red).frame(width: 8, height: 8) } else { Image(systemName: "captions.bubble").foregroundStyle(.orange) }
+                    Text(saved ? m.title : "Live Captions").font(.callout.bold()).lineLimit(1)
+                    Spacer()
+                    Text(saved ? "Recording" : "Not saved").font(.caption.weight(.semibold)).foregroundStyle(saved ? .red : .orange)
                 }
-                Text(m.lines.last.map { "\($0.speaker ?? ""): \($0.text)" } ?? "Listening…")
-                    .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                SessionBanner(meeting: m, compact: true)
+                Text(lastParagraph(m) ?? "Listening…")
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(2).truncationMode(.head)
                 HStack {
                     Button("Show Live") { MeetingPanel.shared.show() }.buttonStyle(.glass)
                     Spacer()
@@ -112,6 +116,12 @@ struct MeetingMenuSection: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .card(tint: state.meeting != nil ? .red : nil)
+        .card(tint: state.meeting.map { state.willSave($0) ? .red : .orange })
+    }
+
+    private func lastParagraph(_ m: MeetingSnapshot) -> String? {
+        let tail = Array(m.lines.suffix(30))
+        guard let p = Formats.paragraphs(tail).last else { return nil }
+        return "\(tail[p[0]].speaker.map { "\($0): " } ?? "")\(p.map { tail[$0].text }.joined(separator: " "))"
     }
 }

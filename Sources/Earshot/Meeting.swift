@@ -20,6 +20,12 @@ struct MeetingSnapshot: Sendable {
     var captionsNeedAccess = false
     /// Stop was pressed: capture is over and the meeting is being finished and saved ("Saving…").
     var stopping = false
+    /// What the meeting app shows about the room and its people (Google Meet today).
+    var context: MeetingContext?
+    /// You are muted in the meeting app, so your microphone isn't being recorded.
+    var selfMuted = false
+    /// A Live Captions session that will be saved as a meeting when it stops (`keepSession()`, or a call's captions).
+    var kept = false
 }
 
 /// Starts/stops meeting sessions from detection, UI or API.
@@ -46,7 +52,7 @@ final class MeetingController {
     func meetingDetected(_ m: DetectedMeeting) {
         guard !quitting else { return }
         if let session {
-            if session.appBundle == m.appBundleID {
+            if session.appBundle == m.appBundleID || (session.appBundle == nil && session.call == m.key) {
                 // The app took the mic again during the auto-stop countdown (next call, rejoin): keep recording.
                 stopCountdown?.cancel()
                 AppState.shared.stoppingAt = nil
@@ -106,6 +112,22 @@ final class MeetingController {
         startedFromDetection = nil
     }
 
+    /// The meeting app showed its end screen ("You left the meeting") or its tab closed: stop now, as the auto-stop
+    /// countdown would.
+    func observedMeetingEnded(_ s: MeetingSession) {
+        guard session === s, Settings.autoStopAfterMeeting else { return }
+        LiveDebug.log("[meet] call ended: stopping \(s.title)")
+        Task { @MainActor in _ = await self.stop(auto: true) }
+    }
+
+    /// Turns the running Live Captions session into a meeting: the audio is kept, polished and saved when it stops.
+    @discardableResult
+    func keepSession() -> Bool {
+        guard let s = session, !s.save else { return false }
+        s.keep()
+        return true
+    }
+
     /// `app`: bundle id to capture ("com.google.Chrome"), or nil/"system" for all system audio.
     @discardableResult
     func start(app: String?, title: String?, platform: String? = nil, appName: String? = nil,
@@ -115,19 +137,23 @@ final class MeetingController {
         let detected = MeetingDetector.shared.current
         let bundle = (app == "system") ? nil : (app ?? detected?.appBundleID)
         let name = appName ?? bundle.map { MeetingDetector.meeting(for: $0).appName } ?? "System audio"
+        let given = title ?? CalendarLookup.currentEventTitle()
+        // System audio while a call is detected records that call: it ends with it and is named after it.
+        let call = bundle == nil ? detected : (detected?.key == bundle ? detected : nil)
         let s = MeetingSession(
             appBundle: bundle,
             appName: name,
             platform: platform ?? name,
-            title: title ?? CalendarLookup.currentEventTitle()
-                ?? (bundle == nil ? "Meeting \(Date().formatted(date: .abbreviated, time: .shortened))" : "\(name) meeting"),
+            title: given ?? (bundle == nil ? "Meeting \(Date().formatted(date: .abbreviated, time: .shortened))" : "\(name) meeting"),
+            genericTitle: given == nil || given == "Live Captions" || given == "\(name) meeting" || given == call?.title,
             captureMic: mic,
             origin: origin,
-            save: save
+            save: save,
+            call: call
         )
         do { try s.start() } catch { s.discard(); throw error }
         session = s
-        startedFromDetection = fromDetection ?? (detected?.key == bundle ? bundle : nil)
+        startedFromDetection = fromDetection ?? call?.key
         AppState.shared.meeting = s.snapshot
         AppState.shared.detectedMeeting = nil
         AppState.shared.stoppingAt = nil
@@ -154,8 +180,9 @@ final class MeetingController {
     }
 
     private func finish(_ s: MeetingSession, auto: Bool) async -> Transcript? {
+        if !s.save, s.keepsAsMeeting { s.keep() }
         // Polish diarizes both recordings again, so a last live diarization would be wasted work.
-        let polish = s.save && (Settings.polishAfterMeeting || s.asrFailed)
+        let polish = s.save && (Settings.polishAfterMeeting || s.asrFailed || s.kept)
         let transcript = PostProcess.apply(await s.stop(diarize: s.save && !polish))
         defer {
             if stopping === s { stopping = nil; stopTask = nil }
@@ -252,17 +279,20 @@ final class MeetingController {
         EventBus.shared.publish("meeting.polishing", ["meeting_id": id, "transcript_id": id])
         let started = Date()
         let manifest = MeetingManifest.read(folder)
-        let options = TranscribeOptions(model: nil, language: t.language, diarize: Settings.diarizeMeetings)
+        let context = t.context ?? MeetingContextFile.read(folder)
+        let spoken = Settings.followMeetingLanguage ? context?.captionLanguage.flatMap(Self.languageCode) : nil
+        let options = TranscribeOptions(model: nil, language: spoken ?? t.language, diarize: Settings.diarizeMeetings)
         var appSegments: [Segment] = [], mine: [Segment] = []
-        var model = t.model, language = t.language
+        var model = t.model, language = options.language
         var duration = 0.0
         if fm.fileExists(atPath: others.path), let samples = await Self.loadTrack(others) {
             duration = Double(samples.count) / SampleSink.rate
-            let out = try await Engine.shared.transcribe(samples: samples, options: options, speakerPrefix: "Speaker")
+            let out = try await Engine.shared.transcribe(samples: samples, options: options, speakerPrefix: "Speaker", context: context)
             model = out.model
             language = language ?? out.language
             appSegments = out.segments.map { var s = $0; s.speaker = s.speaker ?? Settings.participantsName; return s }
-            let names = Self.names(for: appSegments, voices: out.voices, hints: manifest?.speakerHints ?? [])
+            let names = Self.names(for: appSegments, turns: out.turns, words: out.words, voices: out.voices,
+                                   hints: manifest?.speakerHints ?? [], context: context)
             appSegments = appSegments.map { var s = $0; if let n = s.speaker.flatMap({ names[$0] }) { s.speaker = n }; return s }
             var voices: [String: [Float]] = [:]
             for (label, v) in out.voices { voices[names[label] ?? label] = v }
@@ -276,7 +306,7 @@ final class MeetingController {
             mine = out.segments.map { var s = $0; s.speaker = Settings.myName; return s }
         }
         var polished = t
-        polished.segments = (appSegments + mine.filter { !Self.isEcho($0, others: appSegments) }).sorted { $0.start < $1.start }
+        polished.segments = SpeakerPipeline.merge(appSegments + mine.filter { !Self.isEcho($0, others: appSegments) })
         polished = PostProcess.apply(polished)
 
         // The user may have renamed, moved, starred or trashed the meeting meanwhile: update only the content, and
@@ -290,6 +320,12 @@ final class MeetingController {
         AppState.shared.reloadLibrary()
         EventBus.shared.publish("meeting.retranscribed", ["meeting_id": id, "transcript_id": id])
         return fresh
+    }
+
+    /// "en-US" → "en".
+    nonisolated static func languageCode(_ s: String) -> String? {
+        let code = s.lowercased().split(whereSeparator: { $0 == "-" || $0 == "_" }).first.map(String.init) ?? ""
+        return code.isEmpty ? nil : code
     }
 
     /// Decodes a recorded track off the main actor (a 2 h track is ~460 MB of samples).
@@ -330,12 +366,15 @@ final class MeetingController {
         return row[b.count]
     }
 
-    /// "Speaker N" → person: Meet captions first (they name whoever talks), then saved voices. Names learned from
-    /// captions are remembered as voices and added to People.
-    static func names(for segments: [Segment], voices: [String: [Float]], hints: [SpeakerHint]) -> [String: String] {
+    /// "Speaker N" → person: the meeting's captions first (they name whoever talks), then caption hints, then saved
+    /// voices. Names learned from captions are remembered as voices and added to People.
+    static func names(for segments: [Segment], turns: [SpeakerTurn] = [], words: [LiveWord] = [], voices: [String: [Float]],
+                      hints: [SpeakerHint], context: MeetingContext? = nil) -> [String: String] {
         guard Settings.autoNameSpeakers else { return [:] }
-        let turns = segments.compactMap { s in s.speaker.map { (start: s.start, end: s.end, speaker: $0) } }
-        var names = SpeakerNaming.fromHints(turns: turns, hints: hints)
+        let turns = turns.isEmpty ? segments.compactMap { s in s.speaker.map { (start: s.start, end: s.end, speaker: $0) } } : turns
+        var names = context.map { SpeakerPipeline.fromCaptions(turns: turns, context: $0, words: words) } ?? [:]
+        let hinted = SpeakerNaming.fromHints(turns: turns.filter { names[$0.speaker] == nil }, hints: hints)
+        names.merge(hinted.filter { !names.values.contains($0.value) }) { a, _ in a }
         if Settings.rememberVoices {
             for (label, name) in names { if let v = voices[label] { Store.shared.learnVoice(name, v) } }
             let unnamed = voices.filter { names[$0.key] == nil }
@@ -357,12 +396,18 @@ final class MeetingSession {
     let appBundle: String?
     let appName: String
     let platform: String
-    let title: String
+    private(set) var title: String
     let startedAt: Date
     let folder: URL
     let captureMic: Bool
-    let origin: String
-    let save: Bool
+    private(set) var origin: String
+    private(set) var save: Bool
+    /// The call detected when this session started (its key); the session ends with it.
+    let call: String?
+    /// The title is a placeholder ("Live Captions", "Dia meeting"): the meeting's own name replaces it once known.
+    private var genericTitle: Bool
+    /// A Live Captions session turned into a meeting.
+    private(set) var kept = false
 
     private let othersSink: SampleSink
     private let micSink: SampleSink?
@@ -372,10 +417,19 @@ final class MeetingSession {
     private var streams: [LiveStream] = []
     private var diarizeTask: Task<Void, Never>?
     private var watchTask: Task<Void, Never>?
-    private var captions: MeetCaptionWatcher?
+    private var observer: MeetObserver?
+    /// What the meeting app shows (room, people, captions, events), refreshed as it changes.
+    private(set) var context: MeetingContext?
+    private var calendar: CalendarInfo?
+    private var calendarCode: String?
+    private var calendarTried = false
+    private var contextWritten: MeetingContext?
+    private var captionLanguage: String?
+    private var selfMuted = false
+    private var holding = false
+    private var manifestWritten: MeetingManifest?
     private(set) var notes: [Note] = []
     private var hints: [SpeakerHint] = []
-    private var hintsWritten = 0
     private var warning: String?
     private var warned: Set<String> = []
     /// Diarizer speaker id → person, from captions and saved voices.
@@ -395,7 +449,8 @@ final class MeetingSession {
     private var asrDown = false
     static let speechModelWarning = "Speech model not available — recording continues, transcript will be made after the meeting."
 
-    init(appBundle: String?, appName: String, platform: String, title: String, captureMic: Bool, origin: String = "meeting", save: Bool = true) {
+    init(appBundle: String?, appName: String, platform: String, title: String, genericTitle: Bool = false, captureMic: Bool,
+         origin: String = "meeting", save: Bool = true, call: DetectedMeeting? = nil) {
         let id = UUID().uuidString.lowercased(), now = Date()
         self.id = id
         self.startedAt = now
@@ -405,7 +460,10 @@ final class MeetingSession {
         self.appName = appName
         self.platform = platform
         self.title = title
+        self.genericTitle = genericTitle
         self.captureMic = captureMic
+        self.call = call?.key
+        self.meetBundle = Self.meetBrowser(appBundle: appBundle, platform: platform, call: call)
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd_HH-mm-ss"
         let safe = title.replacingOccurrences(of: "/", with: "-").prefix(60)
@@ -419,10 +477,40 @@ final class MeetingSession {
         mic = micSink.map { MicCapture(sink: $0, echoCancellation: Settings.echoCancellation) }
     }
 
+    /// Recovery after a crash keeps what this session would keep at Stop.
     private var manifest: MeetingManifest {
-        MeetingManifest(id: id, title: title, appName: appName, appBundle: appBundle, platform: platform, origin: origin,
-                        startedAt: startedAt, captureMic: captureMic, language: language, notes: notes, speakerHints: hints,
-                        discard: save ? nil : true)
+        let keeps = save || keepsAsMeeting
+        return MeetingManifest(id: id, title: title, appName: appName, appBundle: appBundle, platform: platform,
+                               origin: save || !keeps ? origin : "meeting", startedAt: startedAt, captureMic: captureMic,
+                               language: language, notes: notes, speakerHints: hints, discard: keeps ? nil : true)
+    }
+
+    private func writeManifest() {
+        let m = manifest
+        guard m.title != manifestWritten?.title || m.origin != manifestWritten?.origin || m.discard != manifestWritten?.discard
+                || m.language != manifestWritten?.language || m.notes != manifestWritten?.notes
+                || m.speakerHints.count != manifestWritten?.speakerHints.count else { return }
+        m.write(to: folder)
+        manifestWritten = m
+    }
+
+    /// Live Captions of a call (a Meet page observed, or started while a call was detected) are saved as a meeting.
+    var keepsAsMeeting: Bool {
+        !save && origin == "captions" && Settings.keepLiveCaptionsOfCalls && (observer != nil || call != nil || context?.meetingCode != nil)
+    }
+
+    /// From here on this session is a meeting: saved, polished, in the library.
+    func keep() {
+        guard !save else { return }
+        save = true
+        kept = true
+        origin = "meeting"
+        if genericTitle, title == "Live Captions" {
+            title = CalendarLookup.currentEventTitle() ?? "Meeting \(startedAt.formatted(date: .abbreviated, time: .shortened))"
+        }
+        writeManifest()
+        publish()
+        EventBus.shared.publish("meeting.kept", ["meeting_id": id, "title": title])
     }
 
     /// The running meeting on screen; a stopping session no longer replaces a newer meeting's snapshot.
@@ -438,7 +526,7 @@ final class MeetingSession {
         let clean = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let note = Note(time: now, text: clean.isEmpty ? "Bookmark" : clean, kind: kind)
         notes.append(note)
-        if save { manifest.write(to: folder) }
+        writeManifest()
         publish()
         EventBus.shared.publish("meeting.note", ["meeting_id": id, "kind": kind, "time": Formats.num(note.time), "text": note.text])
         return note
@@ -447,8 +535,9 @@ final class MeetingSession {
     var snapshot: MeetingSnapshot {
         MeetingSnapshot(id: id, title: title, platform: platform, appName: appName, startedAt: startedAt,
                         lines: lines, hypotheses: hypotheses, capturingMic: micSink != nil,
-                        notes: notes, warning: warning, readingCaptions: captions?.active ?? false,
-                        captionsNeedAccess: captionsNeedAccess, stopping: isStopping)
+                        notes: notes, warning: warning, readingCaptions: observer?.active ?? false,
+                        captionsNeedAccess: captionsNeedAccess, stopping: isStopping, context: context,
+                        selfMuted: selfMuted && Settings.respectMute && micSink != nil, kept: kept)
     }
 
     var othersLabel: String { Settings.participantsName }
@@ -466,9 +555,9 @@ final class MeetingSession {
         if let micSink { streams.append(LiveStream(id: "mic", speaker: Settings.myName, sink: micSink, session: self)) }
         streams.forEach { $0.start() }
         if Settings.diarizeMeetings { scheduleDiarization() }
+        startObserver()
         // Unsaved sessions (Live Captions) get a manifest too, so recovery deletes their WAVs after a crash.
-        manifest.write(to: folder)
-        startCaptions()
+        writeManifest()
         watch()
 
         // Sleep: capture pauses and the asleep period is cut from recording and transcript. Synchronous, so no
@@ -502,7 +591,9 @@ final class MeetingSession {
         publish()
         diarizeTask?.cancel()
         watchTask?.cancel()
-        captions?.stop()
+        contextChanged()
+        observer?.stop()
+        writeContext()
         sleepObservers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
         sleepObservers = []
         tap.stop()
@@ -512,27 +603,110 @@ final class MeetingSession {
         hypotheses = [:]
         if diarize, Settings.diarizeMeetings { await diarizeNow(live: false) }
         lines.sort { $0.start < $1.start }
+        let segments = SpeakerPipeline.merge(lines)
         let recorded = Double(max(othersSink.total, micSink?.total ?? 0)) / SampleSink.rate
         return Transcript(
             id: id, createdAt: startedAt, title: title, sourcePath: folder.path, origin: origin,
             model: liveModel ?? Engine.modelID(for: language), language: language,
             duration: recorded > 0 ? recorded : Date().timeIntervalSince(startedAt), processingSeconds: 0,
-            text: Formats.speakerText(lines), segments: lines, notes: notes.isEmpty ? nil : notes
+            text: Formats.speakerText(segments), segments: segments, notes: notes.isEmpty ? nil : notes, context: context
         )
     }
 
-    // MARK: Speaker names from Meet captions
+    // MARK: The meeting app: room, people, captions, mute and end (Google Meet in a browser)
 
-    private func startCaptions() {
-        guard Settings.autoNameSpeakers, let appBundle, MeetingApp.browsers.contains(appBundle) else { return }
-        MeetCaptionWatcher.requestTrust()
-        captions = MeetCaptionWatcher(bundleID: appBundle) { [weak self] name in
+    /// The browser showing the Meet call this session records: its own app, or for system audio the browser of the
+    /// call detected at start.
+    private let meetBundle: String?
+
+    private static func meetBrowser(appBundle: String?, platform: String, call: DetectedMeeting?) -> String? {
+        for id in [appBundle, call?.appBundleID].compactMap({ $0 }) where MeetingApp.browsers.contains(id) {
+            if platform == "Google Meet" || call?.platform == "Google Meet" || MeetObserver.meetPage(bundleID: id) != nil { return id }
+        }
+        return nil
+    }
+
+    private func startObserver() {
+        guard let meetBundle else { return }
+        MeetObserver.requestTrust()
+        let origin = othersSink.origin ?? mach_absolute_time()
+        guard let o = MeetObserver(bundleID: meetBundle, clock: { HostTime.seconds(from: origin, to: HostTime.now) }) else { return }
+        let mic = micSink
+        o.onSelfMute = { [weak self] muted in
+            // Straight from the observer's thread: every millisecond of a mute is blanked.
+            if Settings.respectMute { mic?.gate(muted: muted) }
+            Task { @MainActor in self?.selfMuteChanged(muted) }
+        }
+        o.onEnded = { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.contextChanged()
+                MeetingController.shared.observedMeetingEnded(self)
+            }
+        }
+        o.onChange = { [weak self] in Task { @MainActor in self?.contextChanged() } }
+        o.onCaptionSpeaker = { [weak self] name in
             Task { @MainActor in
                 guard let self else { return }
                 self.hints.append(SpeakerHint(time: self.now, name: name))
             }
         }
-        captions?.start()
+        observer = o
+        if Settings.respectMute, MeetObserver.trusted { holdMic() }
+        o.start()
+        contextChanged()
+    }
+
+    /// The mic track runs 0.75 s behind, so a mute also blanks the words just before it was noticed.
+    private func holdMic() {
+        guard !holding, let micSink else { return }
+        holding = true
+        micSink.hold(seconds: 0.75)
+    }
+
+    private func selfMuteChanged(_ muted: Bool) {
+        if !Settings.respectMute { micSink?.gate(muted: false) }
+        guard muted != selfMuted else { return }
+        selfMuted = muted
+        LiveDebug.log("[meet] self \(muted ? "muted" : "unmuted") at \(String(format: "%.2f", now))")
+        EventBus.shared.publish(muted ? "meeting.mic_muted" : "meeting.mic_unmuted",
+                                ["meeting_id": id, "time": Formats.num(now), "recording": !(muted && Settings.respectMute)])
+        publish()
+    }
+
+    private func contextChanged() {
+        guard let observer else { return }
+        var c = observer.context
+        if !calendarTried || (calendarCode == nil && c.meetingCode != nil) {
+            calendarTried = true
+            calendarCode = c.meetingCode
+            calendar = MeetingDetector.calendarInfo(code: c.meetingCode, title: c.title, at: startedAt) ?? calendar
+        }
+        c.calendar = c.calendar ?? calendar
+        if Settings.respectMute, observer.active { holdMic() }
+        if Settings.followMeetingLanguage, let code = c.captionLanguage.flatMap(MeetingController.languageCode), code != captionLanguage {
+            captionLanguage = code
+            if code != language.flatMap(MeetingController.languageCode) {
+                LiveDebug.log("[meet] caption language \(code): live passes switch to it")
+                language = code
+                streams.forEach { $0.languageChanged() }
+            }
+        }
+        if genericTitle, let better = [c.title, c.calendar?.title].compactMap({ $0?.trimmingCharacters(in: .whitespacesAndNewlines) })
+            .first(where: { !$0.isEmpty && $0 != c.meetingCode }) {
+            title = better
+            genericTitle = false
+        }
+        guard c != context else { return }
+        context = c
+        if save || keepsAsMeeting { writeManifest() }
+        publish()
+    }
+
+    private func writeContext() {
+        guard let context, context != contextWritten else { return }
+        MeetingContextFile.write(context, to: folder)
+        contextWritten = context
     }
 
     // MARK: Watchdog: stalled capture, silent tracks, periodic manifest
@@ -543,10 +717,8 @@ final class MeetingSession {
                 try? await Task.sleep(for: .seconds(5))
                 guard let self else { return }
                 self.checkAudio()
-                if self.save, self.hints.count != self.hintsWritten {
-                    self.hintsWritten = self.hints.count
-                    self.manifest.write(to: self.folder)
-                }
+                if self.save || self.keepsAsMeeting { self.writeManifest() }
+                self.writeContext()
             }
         }
     }
@@ -580,8 +752,8 @@ final class MeetingSession {
             kind = "speech_model"
             message = Self.speechModelWarning
         }
-        let readingCaptions = captions?.active ?? false
-        let needAccess = captions != nil && !MeetCaptionWatcher.trusted
+        let readingCaptions = observer?.active ?? false
+        let needAccess = observer != nil && !MeetObserver.trusted
         guard message != warning || readingCaptions != snapshotCaptions || needAccess != captionsNeedAccess else { return }
         snapshotCaptions = readingCaptions
         captionsNeedAccess = needAccess
@@ -647,7 +819,16 @@ final class MeetingSession {
     // MARK: Live speaker labels: pyannote over the app recording so far, re-run as it grows, revising
     // lines already on screen.
 
-    private var turns: [(start: Double, end: Double, speaker: String)] = []
+    private var turns: [SpeakerTurn] = []
+
+    /// The others track's lines as words, spread evenly over each line (for lining captions up with what was heard).
+    private var liveWords: [LiveWord] {
+        lines.filter { !isMine($0) }.flatMap { l -> [LiveWord] in
+            let parts = l.text.split(separator: " ")
+            let step = (l.end - l.start) / Double(max(1, parts.count))
+            return parts.enumerated().map { i, w in LiveWord(text: " " + w, start: l.start + Double(i) * step, end: l.start + Double(i + 1) * step) }
+        }
+    }
 
     /// Each pass covers the whole recording, so passes are spaced out as it grows (and by how long the last one
     /// took) to leave the engine to live transcription.
@@ -672,13 +853,17 @@ final class MeetingSession {
     /// `live`: a periodic pass, dropped when the meeting stops meanwhile.
     private func diarizeNow(live: Bool) async {
         let url = othersSink.fileURL
+        let context = context
         guard let samples = await Task.detached(priority: .utility, operation: { WAVReader.readMonoPCM16(url) }).value,
-              !(live && Task.isCancelled), samples.count > Int(SampleSink.rate * 2),
-              let result = try? await Engine.shared.diarizeDetailed(samples: samples), !(live && Task.isCancelled) else { return }
-        let (newTurns, embeddings) = stabilised(result)
+              !(live && Task.isCancelled), samples.count > Int(SampleSink.rate * 2) else { return }
+        let bounds = SpeakerPipeline.range(context, duration: Double(samples.count) / SampleSink.rate)
+        guard let result = try? await Engine.shared.diarizeDetailed(samples: samples, speakers: bounds), !(live && Task.isCancelled) else { return }
+        let (newTurns, embeddings) = stabilised(Engine.clean(result, bounded: bounds != nil))
         turns = newTurns
         if Settings.autoNameSpeakers {
-            var names = SpeakerNaming.fromHints(turns: newTurns, hints: hints)
+            var names = context.map { SpeakerPipeline.fromCaptions(turns: newTurns, context: $0, words: liveWords) } ?? [:]
+            let hinted = SpeakerNaming.fromHints(turns: newTurns.filter { names[$0.speaker] == nil }, hints: hints)
+            names.merge(hinted.filter { !names.values.contains($0.value) }) { a, _ in a }
             if Settings.rememberVoices {
                 let unnamed = embeddings.filter { names[$0.key] == nil }
                 names.merge(SpeakerNaming.fromVoices(unnamed, known: Store.shared.voices(), taken: Set(names.values))) { a, _ in a }
@@ -686,11 +871,20 @@ final class MeetingSession {
             speakerNames = names
         }
         var revised = 0
-        for i in lines.indices where !isMine(lines[i]) {
-            if let label = speakerLabel(at: lines[i]), label != lines[i].speaker {
-                lines[i].speaker = label
-                revised += 1
+        var labels = lines.map(\.speaker)
+        for i in lines.indices where !isMine(lines[i]) { labels[i] = speakerLabel(at: lines[i]) ?? labels[i] }
+        // A short line between two lines of the same person is theirs (the others track only).
+        let theirs = lines.indices.filter { !isMine(lines[$0]) }.sorted { lines[$0].start < lines[$1].start }
+        if theirs.count > 2 {
+            for k in 1..<(theirs.count - 1) {
+                let a = theirs[k - 1], b = theirs[k], c = theirs[k + 1]
+                if labels[a] == labels[c], labels[b] != labels[a], lines[b].end - lines[b].start < SpeakerPipeline.flicker,
+                   lines[b].start - lines[a].end < 1, lines[c].start - lines[b].end < 1 { labels[b] = labels[a] }
             }
+        }
+        for i in lines.indices where !isMine(lines[i]) && labels[i] != lines[i].speaker {
+            lines[i].speaker = labels[i]
+            revised += 1
         }
         if revised > 0 {
             publish()
@@ -802,6 +996,12 @@ final class LiveStream {
                 await self.pass(final: false)
             }
         }
+    }
+
+    /// The session's language changed (the meeting's captions): what the other engine decoded no longer agrees.
+    func languageChanged() {
+        previous = []
+        agreements = 0
     }
 
     func finish() async {

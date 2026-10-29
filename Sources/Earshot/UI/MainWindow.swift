@@ -51,7 +51,7 @@ struct MainWindow: View {
     }
 
     private var subtitle: String {
-        if let m = state.meeting { return "Recording \(m.title)" }
+        if let m = state.meeting { return state.willSave(m) ? "Recording \(m.isLiveCaptions ? "Live Captions" : m.title)" : "Live Captions — not saved" }
         if case .transcript = state.route, let t = state.currentTranscript {
             return t.createdAt.formatted(date: .abbreviated, time: .shortened)
         }
@@ -123,16 +123,25 @@ private struct MainToolbar: ToolbarContent {
         }
         ToolbarItemGroup(placement: .primaryAction) {
             if let m = state.meeting {
-                Button { MeetingPanel.shared.show() } label: { Label("Live Transcript", systemImage: "text.bubble") }
-                    .help("Show the live transcript")
+                let saved = state.willSave(m)
+                Button { MeetingPanel.shared.show() } label: {
+                    Label(saved ? "Recording" : "Live Captions (not saved)", systemImage: saved ? "record.circle.fill" : "captions.bubble")
+                        .labelStyle(.titleAndIcon)
+                        .foregroundStyle(saved ? .red : .orange)
+                }
+                .help(saved ? "Recording — show the live transcript" : "Live Captions are shown, not saved. Show them")
+                if m.isLiveCaptions, !saved, !m.stopping {
+                    Button { state.keepLiveCaptions() } label: { Label("Save as Meeting", systemImage: "square.and.arrow.down") }
+                        .help("Keep these Live Captions: they're saved to Meetings when they stop")
+                }
                 if m.stopping {
-                    Button {} label: { Label("Saving…", systemImage: "hourglass") }
+                    Button {} label: { Label(saved ? "Saving…" : "Stopping…", systemImage: "hourglass") }
                         .disabled(true)
-                        .help("Saving the meeting")
+                        .help(saved ? "Saving the meeting" : "Stopping Live Captions")
                 } else {
                     Button(role: .destructive) { state.stopMeeting() } label: { Label("Stop", systemImage: "stop.fill") }
                         .tint(.red)
-                        .help("Stop and save the meeting")
+                        .help(saved ? "Stop and save the meeting" : "Stop Live Captions (nothing is saved)")
                 }
             } else {
                 RecordMenu()
@@ -249,7 +258,7 @@ private struct Sidebar: View {
                 }
 
                 SectionLabel(text: "Library")
-                row("Meetings", "person.2.wave.2", .meetings, live: state.meeting != nil)
+                row("Meetings", "person.2.wave.2", .meetings, live: state.meeting.map(state.willSave) ?? false)
                 row("Transcriptions", "text.alignleft", .transcriptions)
                 row("Dictations", "character.cursor.ibeam", .dictations)
                 row("Recently Deleted", "trash", .deleted)
@@ -358,11 +367,12 @@ private struct SidebarStatus: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             if let m = state.meeting {
+                let saved = state.willSave(m)
                 Button { MeetingPanel.shared.show() } label: {
                     HStack(spacing: 6) {
-                        PulseDot(color: .red, pulsing: true, size: 7)
+                        if saved { PulseDot(color: .red, pulsing: true, size: 7) } else { Image(systemName: "captions.bubble").foregroundStyle(.orange) }
                         TimelineView(.periodic(from: m.startedAt, by: 1)) { ctx in
-                            Text("\(m.appName) · \(Fmt.clock(ctx.date.timeIntervalSince(m.startedAt)))").monospacedDigit()
+                            Text("\(saved ? m.appName : "Live Captions, not saved") · \(Fmt.clock(ctx.date.timeIntervalSince(m.startedAt)))").monospacedDigit()
                         }
                         Spacer()
                     }

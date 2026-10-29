@@ -119,7 +119,8 @@ struct TranscriptDetail: View {
             .panel()
 
             if inspector {
-                Inspector(transcript: transcript, mode: $mode, tab: $inspectorTab, favoritesOnly: $favoritesOnly, fontSize: $fontSize)
+                Inspector(transcript: transcript, mode: $mode, tab: $inspectorTab, favoritesOnly: $favoritesOnly, fontSize: $fontSize,
+                          seek: { player.seek($0) })
                     .frame(width: 320)
                     .panel()
             }
@@ -127,7 +128,8 @@ struct TranscriptDetail: View {
         .onAppear { player.load(transcript) }
         .onDisappear { player.stop() }
         .onChange(of: fontSize) { Settings.fontSize = fontSize }
-        .onChange(of: LayoutKey(segments: transcript.segments, favoritesOnly: favoritesOnly, mode: mode, search: state.search), initial: true) { _, key in
+        .onChange(of: LayoutKey(segments: transcript.segments, chats: Formats.chats(transcript.context), favoritesOnly: favoritesOnly,
+                                mode: mode, search: state.search), initial: true) { _, key in
             layout = TranscriptLayout(key)
         }
     }
@@ -135,6 +137,7 @@ struct TranscriptDetail: View {
 
 private struct LayoutKey: Equatable {
     let segments: [Segment]
+    let chats: [MeetingEvent]
     let favoritesOnly: Bool
     let mode: String
     let search: String
@@ -143,9 +146,17 @@ private struct LayoutKey: Equatable {
 /// Everything the transcript list needs that depends only on the segments, the filter and the search, so it's
 /// built once per change instead of on every playback tick.
 struct TranscriptLayout {
+    /// A speaker paragraph, or a chat message shown where it was sent.
+    struct Block: Identifiable {
+        var id: Int
+        var items: [(Int, Segment)] = []
+        var chat: MeetingEvent?
+        var start: Double { chat?.t ?? items.first?.1.start ?? 0 }
+    }
+
     var shown: [(Int, Segment)] = []
-    var paragraphs: [[(Int, Segment)]] = []
-    /// Scroll id (segment index, or the first segment of its paragraph in the editor) per segment index.
+    var blocks: [Block] = []
+    /// Scroll id (the first segment of its paragraph) per segment index.
     var anchor: [Int: Int] = [:]
     var terms: [String] = []
     var matches = 0
@@ -159,9 +170,15 @@ struct TranscriptLayout {
         Self.counter += 1
         version = Self.counter
         shown = key.segments.enumerated().filter { !key.favoritesOnly || $0.element.favorite == true }.map { ($0.offset, $0.element) }
-        paragraphs = Self.paragraphs(shown)
+        let chats = key.favoritesOnly ? [] : key.chats
+        let paragraphs = Formats.paragraphs(shown, breaks: chats.map(\.t)) { $0.1 }
         for para in paragraphs {
-            for (i, _) in para { anchor[i] = key.mode == "editor" ? para[0].0 : i }
+            for (i, _) in para { anchor[i] = para[0].0 }
+        }
+        blocks = paragraphs.map { Block(id: $0[0].0, items: $0) }
+        if !chats.isEmpty {
+            blocks += chats.enumerated().map { Block(id: -1 - $0.offset, chat: $0.element) }
+            blocks.sort { $0.start != $1.start ? $0.start < $1.start : $0.chat != nil && $1.chat == nil }
         }
         terms = SearchHighlight.terms(key.search)
         guard !terms.isEmpty else { return }
@@ -173,18 +190,6 @@ struct TranscriptLayout {
     }
 
     private init() {}
-
-    static func paragraphs(_ segs: [(Int, Segment)]) -> [[(Int, Segment)]] {
-        var out: [[(Int, Segment)]] = []
-        for item in segs {
-            if let last = out.last?.last, last.1.speaker == item.1.speaker, item.1.start - last.1.end < 8, out.last!.count < 12 {
-                out[out.count - 1].append(item)
-            } else {
-                out.append([item])
-            }
-        }
-        return out
-    }
 }
 
 /// Word-prefix, case- and diacritic-insensitive matching of every search term, like the library's search.
@@ -278,59 +283,123 @@ private struct SegmentList: View, Equatable {
     }
 
     var body: some View {
-        if mode == "editor" { editor } else { segments }
+        Group { if mode == "editor" { editor } else { segments } }
+            .environment(\.openURL, OpenURLAction { url in
+                guard url.scheme == Self.seekScheme, let i = Int(url.absoluteString.dropFirst(Self.seekScheme.count + 1)),
+                      transcript.segments.indices.contains(i) else { return .systemAction }
+                seek(transcript.segments[i].start)
+                return .handled
+            })
+    }
+
+    static let seekScheme = "earshot-seek"
+
+    /// One paragraph as one selectable text; each segment is a link to its own time, so clicking a word plays from there.
+    private func paragraph(_ items: [(Int, Segment)]) -> Text {
+        var a = AttributedString()
+        for (n, (i, s)) in items.enumerated() {
+            var piece = SearchHighlight.attributed(s.text.trimmingCharacters(in: .whitespaces), terms: layout.terms)
+            piece.link = URL(string: "\(Self.seekScheme):\(i)")
+            if i == current {
+                piece.foregroundColor = .accentColor
+                piece.backgroundColor = Color.accentColor.opacity(0.14)
+            }
+            if n > 0 { a += AttributedString(" ") }
+            a += piece
+        }
+        return Text(a)
     }
 
     /// Editor: paragraphs per speaker turn with a speaker chip and timestamp.
     private var editor: some View {
         LazyVStack(alignment: .leading, spacing: 22) {
-            ForEach(layout.paragraphs, id: \.first!.0) { para in
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 8) {
-                        SpeakerChip(transcript: transcript, speaker: para.first!.1.speaker)
-                        Text(Fmt.clock(para.first!.1.start)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            ForEach(layout.blocks) { block in
+                if let chat = block.chat {
+                    ChatLine(event: chat, fontSize: fontSize) { seek(chat.t) }.id(block.id)
+                } else {
+                    let first = block.items[0].1
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            SpeakerChip(transcript: transcript, speaker: first.speaker)
+                            Button { seek(first.start) } label: {
+                                Text(Fmt.clock(first.start)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain).help("Play from here")
+                        }
+                        paragraph(block.items)
+                            .font(.system(size: fontSize))
+                            .lineSpacing(5)
+                            .tint(.primary)
+                            .textSelection(.enabled)
                     }
-                    para.reduce(Text("")) { acc, item in
-                        let (i, s) = item
-                        let piece = Text(SearchHighlight.attributed(s.text, terms: layout.terms) + " ")
-                            .foregroundStyle(i == current ? Color.accentColor : Color.primary)
-                        return Text("\(acc)\(piece)")
-                    }
-                    .font(.system(size: fontSize))
-                    .lineSpacing(5)
-                    .textSelection(.enabled)
-                    .onTapGesture { seek(para.first!.1.start) }
+                    .id(block.id)
                 }
-                .id(para.first!.0)
             }
         }
     }
 
-    /// Segments: one row per segment with timestamp, speaker and favourite star.
+    /// Segments: one row per paragraph with timestamp, speaker and favourite star.
     private var segments: some View {
         LazyVStack(alignment: .leading, spacing: 4) {
-            ForEach(layout.shown, id: \.0) { i, s in
-                HStack(alignment: .firstTextBaseline, spacing: 12) {
-                    Text(Fmt.clock(s.start)).font(.caption.monospacedDigit()).foregroundStyle(.secondary).frame(width: 52, alignment: .leading)
-                    if let who = s.speaker {
-                        Text(who).font(.caption.bold()).foregroundStyle(SpeakerColor.of(who)).frame(width: 90, alignment: .leading)
+            ForEach(layout.blocks) { block in
+                if let chat = block.chat {
+                    ChatLine(event: chat, fontSize: fontSize) { seek(chat.t) }.padding(.horizontal, 10).id(block.id)
+                } else {
+                    let first = block.items[0].1
+                    let starred = block.items.allSatisfy { $0.1.favorite == true }
+                    let playing = current.map { c in block.items.contains { $0.0 == c } } ?? false
+                    HStack(alignment: .firstTextBaseline, spacing: 12) {
+                        Button { seek(first.start) } label: {
+                            Text(Fmt.clock(first.start)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                                .frame(width: 52, alignment: .leading)
+                        }
+                        .buttonStyle(.plain).help("Play from here")
+                        if let who = first.speaker {
+                            Text(who).font(.caption.bold()).foregroundStyle(SpeakerColor.of(who)).frame(width: 90, alignment: .leading)
+                        }
+                        paragraph(block.items).font(.system(size: fontSize)).tint(.primary).textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Button { state.toggleFavorite(transcript, block.items.map(\.0)) } label: {
+                            Image(systemName: starred ? "star.fill" : "star").foregroundStyle(starred ? .yellow : .secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help(starred ? "Remove from favorites" : "Add to favorites")
+                        .accessibilityLabel(starred ? "Remove from favorites" : "Add to favorites")
                     }
-                    Text(SearchHighlight.attributed(s.text, terms: layout.terms)).font(.system(size: fontSize)).textSelection(.enabled)
-                    Spacer()
-                    Button { state.toggleFavorite(transcript, i) } label: {
-                        Image(systemName: s.favorite == true ? "star.fill" : "star").foregroundStyle(s.favorite == true ? .yellow : .secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help(s.favorite == true ? "Remove from favorites" : "Add to favorites")
-                    .accessibilityLabel(s.favorite == true ? "Remove from favorites" : "Add to favorites")
+                    .padding(.vertical, 6).padding(.horizontal, 10)
+                    .background { if playing { RoundedRectangle(cornerRadius: 8).fill(.fill.tertiary) } }
+                    .id(block.id)
                 }
-                .padding(.vertical, 6).padding(.horizontal, 10)
-                .background { if i == current { RoundedRectangle(cornerRadius: 8).fill(.fill.tertiary) } }
-                .contentShape(Rectangle())
-                .onTapGesture { seek(s.start) }
-                .id(i)
             }
         }
+    }
+}
+
+/// A chat message sent during the meeting, set apart from speech.
+struct ChatLine: View {
+    let event: MeetingEvent
+    var fontSize: Double = 14
+    let seek: () -> Void
+
+    var body: some View {
+        Button(action: seek) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: "bubble.left.fill").foregroundStyle(.teal)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(event.who ?? "Chat").font(.caption.bold())
+                        Text("in chat · \(Fmt.clock(event.t))").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    }
+                    Text(event.text ?? "").font(.system(size: max(11, fontSize - 2))).frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                }
+            }
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            .background(.teal.opacity(0.10), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Chat message. Click to play from here")
     }
 }
 
@@ -425,6 +494,7 @@ private struct Inspector: View {
     @Binding var tab: String
     @Binding var favoritesOnly: Bool
     @Binding var fontSize: Double
+    let seek: (Double) -> Void
     @State private var newSpeaker = ""
 
     var body: some View {
@@ -432,11 +502,18 @@ private struct Inspector: View {
             VStack(alignment: .leading, spacing: 14) {
                 Picker("Inspector", selection: $tab) {
                     Label("Transcript", systemImage: "text.alignleft").labelStyle(.iconOnly).tag("transcript")
+                    if transcript.context != nil {
+                        Label("Meeting", systemImage: "person.2").labelStyle(.iconOnly).tag("meeting")
+                    }
                     Label("Info", systemImage: "info.circle").labelStyle(.iconOnly).tag("info")
                 }
-                .pickerStyle(.segmented).labelsHidden().frame(width: 110)
+                .pickerStyle(.segmented).labelsHidden().frame(width: transcript.context == nil ? 110 : 160)
 
-                if tab == "transcript" { transcriptTab } else { infoTab }
+                switch tab {
+                case "meeting": if let c = transcript.context { MeetingInfo(transcript: transcript, context: c, seek: seek) } else { infoTab }
+                case "info": infoTab
+                default: transcriptTab
+                }
             }
             .padding(16)
         }

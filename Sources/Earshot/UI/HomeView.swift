@@ -57,19 +57,29 @@ private struct NowCard: View {
     var body: some View {
         Group {
             if let m = state.meeting {
+                let saved = state.willSave(m)
                 VStack(alignment: .leading, spacing: 8) {
-                    CardHeader(title: "Recording \(m.appName)", icon: "record.circle") {
+                    CardHeader(title: saved ? "Recording \(m.appName)" : "Live Captions — not saved", icon: saved ? "record.circle" : "captions.bubble") {
+                        if !m.people.isEmpty {
+                            Tag(text: "\(m.people.count) in call", color: .secondary)
+                                .help(m.people.map(\.name).joined(separator: "\n"))
+                        }
+                        if m.selfMuted { Tag(text: "Muted", color: .orange).help("You're muted — your mic isn't recorded") }
                         if m.readingCaptions { Tag(text: "Names from captions", color: .green) }
                         TimelineView(.periodic(from: m.startedAt, by: 1)) { ctx in
                             Text(Fmt.clock(ctx.date.timeIntervalSince(m.startedAt))).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                         }
                     }
                     HStack(spacing: 8) {
-                        PulseDot(color: .red, pulsing: true)
+                        if saved { PulseDot(color: .red, pulsing: true) } else { Image(systemName: "captions.bubble").foregroundStyle(.orange) }
                         Text(m.title).font(.title3.weight(.semibold)).lineLimit(1)
                     }
-                    ForEach(m.lines.suffix(2), id: \.start) { line in
-                        Text("\(line.speaker.map { "\($0): " } ?? "")\(line.text)").font(.callout).foregroundStyle(.secondary).lineLimit(2)
+                    SessionBanner(meeting: m, compact: true)
+                    let recent = Formats.paragraphs(Array(m.lines.suffix(40))).suffix(2)
+                    let tail = Array(m.lines.suffix(40))
+                    ForEach(Array(recent.enumerated()), id: \.offset) { _, p in
+                        Text("\(tail[p[0]].speaker.map { "\($0): " } ?? "")\(p.map { tail[$0].text }.joined(separator: " "))")
+                            .font(.callout).foregroundStyle(.secondary).lineLimit(2, reservesSpace: false).truncationMode(.head)
                     }
                     if m.lines.isEmpty { Text("Listening…").font(.callout).foregroundStyle(.secondary) }
                     if let w = m.warning { Label(w, systemImage: "exclamationmark.triangle.fill").font(.callout).foregroundStyle(.orange) }
@@ -88,7 +98,7 @@ private struct NowCard: View {
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .card(tint: .red)
+                .card(tint: saved ? .red : .orange)
             } else if let started = state.recordingStarted {
                 HStack(spacing: 10) {
                     PulseDot(color: .red, pulsing: true)

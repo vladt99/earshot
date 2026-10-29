@@ -56,6 +56,8 @@ struct DetectedMeeting: Equatable, Sendable {
     var platform: String
     var title: String
     var url: String?
+    /// Google Meet's meeting code, when the call runs in a browser tab.
+    var meetingCode: String? = nil
 
     var key: String { appBundleID }
 }
@@ -81,11 +83,15 @@ final class MeetingDetector {
     private var everStarted = false
     private var lastEvent = Date.distantPast
     private var resyncTask: Task<Void, Never>?
+    /// What each call was detected as (a browser tab's Meet page is read once, not on every access).
+    private var detected: [String: DetectedMeeting] = [:]
 
-    var current: DetectedMeeting? { appsInMeeting.first.map(Self.meeting(for:)) }
+    var current: DetectedMeeting? { appsInMeeting.first.map(meeting(for:)) }
 
     /// Calls in progress that the user hasn't chosen to ignore.
-    var activeMeetings: [DetectedMeeting] { appsInMeeting.filter { !ignored.contains($0) }.map(Self.meeting(for:)) }
+    var activeMeetings: [DetectedMeeting] { appsInMeeting.filter { !ignored.contains($0) }.map(meeting(for:)) }
+
+    private func meeting(for id: String) -> DetectedMeeting { detected[id] ?? Self.meeting(for: id) }
 
     func start() {
         guard process == nil else { return }
@@ -209,7 +215,10 @@ final class MeetingDetector {
                 t.cancel() // came back within 4 s: same meeting (mute toggle, device switch)
             } else if !appsInMeeting.contains(id) {
                 appsInMeeting.append(id)
-                didDetect(Self.meeting(for: id))
+                let m = Self.meeting(for: id)
+                detected[id] = m
+                didDetect(m)
+                if MeetingApp.browsers.contains(id), m.platform != "Google Meet" { recheckMeet(id) }
             }
         }
         for id in micHolders where !now.contains(id) {
@@ -226,7 +235,7 @@ final class MeetingDetector {
         pendingRelease[id] = nil
         appsInMeeting.removeAll { $0 == id }
         ignored.remove(id)
-        let m = Self.meeting(for: id)
+        let m = detected.removeValue(forKey: id) ?? Self.meeting(for: id)
         if AppState.shared.detectedMeeting?.key == id {
             // A detected call that was never answered ended: take its prompt down.
             AppState.shared.detectedMeeting = nil
@@ -248,8 +257,35 @@ final class MeetingDetector {
     static func meeting(for bundleID: String) -> DetectedMeeting {
         let app = MeetingApp.find(bundleID)
         let name = app?.name ?? NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first?.localizedName ?? bundleID
+        // Google Meet in a browser tab: the page names the meeting and carries its code.
+        if app?.isBrowser == true, let page = MeetObserver.meetPage(bundleID: bundleID) {
+            let title = page.title ?? CalendarLookup.info(code: page.code, title: nil, at: Date())?.title ?? CalendarLookup.currentEventTitle()
+            return DetectedMeeting(appBundleID: bundleID, appName: name, platform: "Google Meet", title: title ?? "Google Meet meeting",
+                                   url: page.url, meetingCode: page.code)
+        }
         return DetectedMeeting(appBundleID: bundleID, appName: name, platform: name,
                                title: CalendarLookup.currentEventTitle() ?? "\(name) meeting", url: nil)
+    }
+
+    /// The Meet page may still be loading when the browser takes the mic: look again a few seconds later.
+    private func recheckMeet(_ id: String) {
+        Task { @MainActor in
+            for delay in [3.0, 8.0] {
+                try? await Task.sleep(for: .seconds(delay))
+                guard appsInMeeting.contains(id), detected[id]?.platform != "Google Meet" else { return }
+                let m = Self.meeting(for: id)
+                guard m.platform == "Google Meet" else { continue }
+                detected[id] = m
+                if AppState.shared.detectedMeeting?.key == id { AppState.shared.detectedMeeting = m }
+                return
+            }
+        }
+    }
+
+    /// The calendar event of a call: one overlapping `at` whose URL, location or notes hold the meeting code, else one
+    /// with the same title. Never asks for calendar access.
+    nonisolated static func calendarInfo(code: String?, title: String?, at: Date) -> CalendarInfo? {
+        CalendarLookup.info(code: code, title: title, at: at)
     }
 
     func detect() -> DetectedMeeting? { current }
@@ -273,5 +309,42 @@ enum CalendarLookup {
         let events = store.events(matching: predicate)
             .filter { !$0.isAllDay && $0.startDate <= now.addingTimeInterval(15 * 60) && $0.endDate >= now.addingTimeInterval(-5 * 60) }
         return events.min { abs($0.startDate.timeIntervalSince(now)) < abs($1.startDate.timeIntervalSince(now)) }?.title
+    }
+
+    static func info(code: String?, title: String?, at date: Date) -> CalendarInfo? {
+        guard Settings.useCalendarTitles, EKEventStore.authorizationStatus(for: .event) == .fullAccess else { return nil }
+        let predicate = store.predicateForEvents(withStart: date.addingTimeInterval(-6 * 3600), end: date.addingTimeInterval(3600), calendars: nil)
+        let events = store.events(matching: predicate)
+            .filter { !$0.isAllDay && $0.startDate <= date.addingTimeInterval(20 * 60) && $0.endDate >= date.addingTimeInterval(-10 * 60) }
+            .sorted { abs($0.startDate.timeIntervalSince(date)) < abs($1.startDate.timeIntervalSince(date)) }
+        func norm(_ s: String?) -> String {
+            (s ?? "").replacingOccurrences(of: "…", with: "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }
+        var match: EKEvent?
+        if let code = code?.lowercased(), !code.isEmpty {
+            match = events.first { e in [e.url?.absoluteString, e.location, e.notes].contains { $0?.lowercased().contains(code) == true } }
+        }
+        let t = norm(title)
+        if match == nil, t.count >= 3 {
+            match = events.first { norm($0.title) == t }
+                ?? events.first { let n = norm($0.title); return n.count >= 3 && (n.hasPrefix(t) || t.hasPrefix(n)) }
+        }
+        guard let e = match else { return nil }
+        func email(_ p: EKParticipant?) -> String? {
+            guard let s = p?.url.absoluteString, s.lowercased().hasPrefix("mailto:") else { return nil }
+            return String(s.dropFirst(7)).removingPercentEncoding
+        }
+        func status(_ s: EKParticipantStatus) -> String {
+            switch s {
+            case .accepted: "accepted"
+            case .declined: "declined"
+            case .tentative: "tentative"
+            case .pending: "pending"
+            default: "unknown"
+            }
+        }
+        return CalendarInfo(eventID: e.eventIdentifier, title: e.title, organizer: e.organizer.flatMap { $0.name ?? email($0) },
+                            notes: e.notes, start: e.startDate, end: e.endDate,
+                            attendees: (e.attendees ?? []).map { .init(name: $0.name, email: email($0), status: status($0.participantStatus)) })
     }
 }

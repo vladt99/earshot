@@ -49,7 +49,7 @@ enum PostProcess {
         case "vtt": return Data(Formats.vtt(t).utf8)
         case "md": return Data(Formats.markdown(t).utf8)
         case "json": return (try? JSONSerialization.data(withJSONObject: Formats.verbose(t), options: [.prettyPrinted, .sortedKeys])) ?? Data()
-        default: return Data(Formats.speakerText(t.segments).utf8)
+        default: return Data(Formats.plainText(t).utf8)
         }
     }
 

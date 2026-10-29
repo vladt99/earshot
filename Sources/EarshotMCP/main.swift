@@ -7,7 +7,7 @@ import Foundation
 //   claude mcp add earshot -- /Applications/Earshot.app/Contents/MacOS/earshot-mcp
 
 let supportedVersions = ["2025-06-18", "2025-03-26", "2024-11-05"]
-let serverVersion = "0.9.0"
+let serverVersion = "0.10.0"
 
 struct Tool {
     let name: String
@@ -87,20 +87,21 @@ let tools: [Tool] = [
         return pretty(try await request("GET", "v1/search", query: q))
     },
     Tool(name: "list_meetings",
-         description: "Most recent recorded meetings: id, title, date, duration, preview.",
+         description: "Most recent recorded meetings: id, title, date, duration, preview, participants, platform, meeting code and link.",
          properties: ["limit": ["type": "integer", "description": "How many (default 20)"]],
          required: []) { a in
         pretty(try await request("GET", "v1/meetings", query: ["limit": "\((a["limit"] as? Int) ?? 20)"]))
     },
     Tool(name: "get_transcript",
-         description: "One transcript by id. format \"text\" gives speaker-labelled plain text; \"json\" gives segments with timestamps, speakers and notes.",
+         description: "One transcript by id. format \"text\" gives a header (title, date, meeting room, calendar event, participants) and speaker paragraphs; \"json\" gives segments with timestamps, speakers, notes and the meeting context (participants with guest/bot flags, room, calendar event, joined/left/chat events).",
          properties: ["id": ["type": "string"], "format": ["type": "string", "enum": ["text", "json"]]],
          required: ["id"]) { a in
-        let format = string(a, "format") == "json" ? "verbose_json" : "text"
-        return pretty(try await request("GET", "v1/transcripts/" + segment(string(a, "id") ?? ""), query: ["format": format]))
+        let r = try await request("GET", "v1/transcripts/" + segment(string(a, "id") ?? ""), query: ["format": "verbose_json"])
+        guard string(a, "format") != "json", let d = r as? [String: Any] else { return pretty(r) }
+        return textView(d)
     },
     Tool(name: "current_meeting",
-         description: "The meeting being recorded right now: live transcript so far, notes, warnings. Says so when nothing is recording.",
+         description: "The meeting being recorded right now: live transcript so far, notes, warnings, participants and room (context), whether you are muted (self_muted) and whether it is only Live Captions that won't be saved (live_captions, saved). Says so when nothing is recording.",
          properties: [:], required: []) { _ in
         pretty(try await request("GET", "v1/meetings/current"))
     },
@@ -137,6 +138,29 @@ let tools: [Tool] = [
         return pretty(["id": d["id"] ?? "", "text": d["text"] ?? "", "duration": d["duration"] ?? 0])
     },
 ]
+
+/// Header lines (what, when, where, who) above the speaker paragraphs.
+func textView(_ d: [String: Any]) -> String {
+    var head = [d["title"] as? String ?? ""]
+    if let date = d["created_at"] as? String { head.append("Date: " + date) }
+    if let c = d["context"] as? [String: Any] {
+        let room = [c["platform_name"] as? String, c["meeting_code"] as? String, c["url"] as? String].compactMap { $0 }
+        if !room.isEmpty { head.append("Meeting: " + room.joined(separator: " · ")) }
+        if let cal = c["calendar"] as? [String: Any], let title = cal["title"] as? String {
+            head.append("Calendar: " + title + ((cal["organizer"] as? String).map { " (organizer: \($0))" } ?? ""))
+        }
+        let people = (c["participants"] as? [[String: Any]] ?? []).filter { $0["presentation"] as? Bool != true }.map { p in
+            (p["name"] as? String ?? "") + (p["bot"] as? Bool == true ? " (bot)" : p["external"] as? Bool == true ? " (guest)" : "")
+        }
+        if !people.isEmpty { head.append("Participants: " + people.joined(separator: ", ")) }
+    }
+    let notes = (d["notes"] as? [[String: Any]] ?? []).compactMap { n -> String? in
+        guard let text = n["text"] as? String, !text.isEmpty else { return nil }
+        return "- " + text
+    }
+    if !notes.isEmpty { head.append("Notes:\n" + notes.joined(separator: "\n")) }
+    return head.joined(separator: "\n") + "\n\n" + (d["text"] as? String ?? "")
+}
 
 // MARK: - JSON-RPC loop
 

@@ -7,9 +7,10 @@
 	<key>CFBundleName</key><string>Earshot</string>
 	<key>CFBundleDisplayName</key><string>Earshot</string>
 	<key>CFBundleIconFile</key><string>AppIcon</string>
+	<key>CFBundleIconName</key><string>AppIcon</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
-	<key>CFBundleShortVersionString</key><string>0.9.0</string>
-	<key>CFBundleVersion</key><string>10</string>
+	<key>CFBundleShortVersionString</key><string>0.10.0</string>
+	<key>CFBundleVersion</key><string>11</string>
 	<key>LSMinimumSystemVersion</key><string>26.0</string>
 	<key>LSUIElement</key><false/>
 	<key>LSMultipleInstancesProhibited</key><true/>

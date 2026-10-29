@@ -24,6 +24,9 @@ struct EngineOutput: Sendable {
     var segments: [Segment]
     /// Speaker label ("Speaker 1") → voice embedding, when diarized.
     var voices: [String: [Float]] = [:]
+    /// Every timed word, and the cleaned speaker turns under the same labels (for naming from captions).
+    var words: [LiveWord] = []
+    var turns: [SpeakerTurn] = []
 }
 
 /// Diarizer output: turns plus one voice embedding per speaker id.
@@ -70,6 +73,8 @@ actor Engine {
     private var whisperFailedAt = Date.distantPast
     private var whisperPrompt: (terms: [String], tokens: [Int]?)?
     private var diarizer: OfflineDiarizerManager?
+    /// Clustering bounded by the meeting's roster (same models, other speaker-count limits).
+    private var bounded: (min: Int, max: Int, manager: OfflineDiarizerManager)?
     private var ctc: CtcModels?
     private var boosting: (terms: [String], session: VocabularyBoostingSession)?
     private(set) var loadedModel: String?
@@ -158,7 +163,10 @@ actor Engine {
     /// Downloads and loads the speaker model without running it (Settings → Download).
     func prepareDiarizer() async throws { _ = try await loadDiarizer() }
 
-    func unloadDiarizer() { diarizer = nil }
+    func unloadDiarizer() {
+        diarizer = nil
+        bounded = nil
+    }
 
     /// First launch: fetch every speech model so the first meeting doesn't wait on a download.
     func prepareSpeechModels() async {
@@ -221,6 +229,7 @@ actor Engine {
                 let config = WhisperKitConfig(modelFolder: ModelCatalog.whisperFolder.path, tokenizerFolder: base,
                                               computeOptions: WhisperSupport.compute, verbose: false, logLevel: .error,
                                               load: true, download: false)
+                config.segmentSeeker = PromptAlignedSeeker()
                 let kit = try await WhisperKit(config)
                 whisper = kit
                 loadedModel = Self.whisperID
@@ -363,8 +372,10 @@ actor Engine {
         return out
     }
 
-    /// Full transcription of 16 kHz mono samples, optionally with speaker labels.
-    func transcribe(samples: [Float], options: TranscribeOptions, speakerPrefix: String = "Speaker") async throws -> EngineOutput {
+    /// Full transcription of 16 kHz mono samples, optionally with speaker labels. `context`: the meeting the audio
+    /// comes from, which bounds how many speakers there can be.
+    func transcribe(samples: [Float], options: TranscribeOptions, speakerPrefix: String = "Speaker",
+                    context: MeetingContext? = nil) async throws -> EngineOutput {
         let whisper = Self.usesWhisper(language: options.language, model: options.model)
         let words: [LiveWord], language: String?
         if whisper {
@@ -374,28 +385,43 @@ actor Engine {
             language = options.language
         }
         var segments = LiveStream.lines(from: words, offset: 0, speaker: nil)
-        var voices: [String: [Float]] = [:]
+        var voices: [String: [Float]] = [:], turns: [SpeakerTurn] = []
+        let duration = Double(samples.count) / SampleSink.rate
 
         if options.diarize, !words.isEmpty {
             await publish("Identifying speakers…")
             // A clip the diarizer can't handle (too short, no speech found) keeps its text, just without speakers.
             do {
-                let speakers = try await diarizeDetailed(samples: samples)
+                let bounds = SpeakerPipeline.range(context, duration: duration)
+                let speakers = Self.clean(try await diarizeDetailed(samples: samples, speakers: bounds), bounded: bounds != nil)
                 let (labelled, labels) = Self.attribute(words, turns: speakers.turns, prefix: speakerPrefix)
                 segments = labelled
                 for (id, label) in labels { voices[label] = speakers.embeddings[id] }
+                turns = speakers.turns.compactMap { t in labels[t.speaker].map { (t.start, t.end, $0) } }
             } catch {
                 LiveDebug.log("[diarize] skipped: \(error)")
             }
+            await publish("Ready")
         }
         return EngineOutput(
             model: whisper ? Self.whisperID : Self.modelID,
             language: language,
-            duration: Double(samples.count) / SampleSink.rate,
+            duration: duration,
             text: Formats.speakerText(segments),
             segments: segments,
-            voices: voices
+            voices: voices,
+            words: words,
+            turns: turns
         )
+    }
+
+    /// Diarizer clusters → turns without flicker, split voices merged; without a roster bound, clusters that
+    /// hardly speak are also folded into their neighbours.
+    static func clean(_ s: SpeakerTurns, bounded: Bool) -> SpeakerTurns {
+        let (turns, embeddings) = SpeakerPipeline.tidy(s.turns, embeddings: s.embeddings,
+                                                       same: bounded ? SpeakerPipeline.sameVoiceBounded : SpeakerPipeline.sameVoice, absorb: !bounded)
+        let smooth = SpeakerPipeline.smooth(turns)
+        return SpeakerTurns(turns: smooth, embeddings: embeddings.filter { id, _ in smooth.contains { $0.speaker == id } })
     }
 
     /// One streaming pass over the unconfirmed tail of a live stream (`whisper`: from `liveUsesWhisper`).
@@ -423,9 +449,23 @@ actor Engine {
         try await diarizeDetailed(samples: samples).turns
     }
 
-    /// Speaker turns plus each speaker's voice embedding (for recognising people across meetings).
-    func diarizeDetailed(samples: [Float]) async throws -> SpeakerTurns {
-        let d = try await loadDiarizer()
+    /// Speaker turns plus each speaker's voice embedding (for recognising people across meetings). `speakers`: how
+    /// many people can be talking (from the meeting's roster); the diarizer finds no more than `max`.
+    func diarizeDetailed(samples: [Float], speakers: (min: Int, max: Int)? = nil) async throws -> SpeakerTurns {
+        var d = try await loadDiarizer()
+        if let speakers {
+            if let b = bounded, b.min == speakers.min, b.max == speakers.max {
+                d = b.manager
+            } else {
+                var config = OfflineDiarizerConfig()
+                config.clustering.minSpeakers = speakers.min
+                config.clustering.maxSpeakers = speakers.max
+                let m = OfflineDiarizerManager(config: config)
+                try await m.prepareModels()
+                bounded = (speakers.min, speakers.max, m)
+                d = m
+            }
+        }
         await acquire()
         defer { release() }
         let result = try await d.process(audio: samples)
@@ -433,39 +473,25 @@ actor Engine {
                             embeddings: result.speakerDatabase ?? [:])
     }
 
-    /// Words → lines labelled "Speaker N" (numbered by first appearance), split at speaker changes and sentence ends.
+    /// Words → segments labelled "Speaker N" (numbered by first appearance), one speaker per sentence.
     /// Also returns diarizer id → label.
-    static func attribute(_ words: [LiveWord], turns: [(start: Double, end: Double, speaker: String)], prefix: String) -> ([Segment], [String: String]) {
+    static func attribute(_ words: [LiveWord], turns: [SpeakerTurn], prefix: String) -> ([Segment], [String: String]) {
         var numbers: [String: Int] = [:]
-        func label(_ w: LiveWord) -> String? {
-            let mid = (w.start + w.end) / 2
-            let hit = turns.first { mid >= $0.start && mid <= $0.end }
-                ?? turns.min { abs(($0.start + $0.end) / 2 - mid) < abs(($1.start + $1.end) / 2 - mid) }
-            guard let id = hit?.speaker else { return nil }
-            if numbers[id] == nil { numbers[id] = numbers.count + 1 }
-            return "\(prefix) \(numbers[id]!)"
+        let segments = SpeakerPipeline.attribute(words, turns: turns).map { s -> Segment in
+            var s = s
+            if let id = s.speaker {
+                if numbers[id] == nil { numbers[id] = numbers.count + 1 }
+                s.speaker = "\(prefix) \(numbers[id]!)"
+            }
+            return s
         }
-        var out: [Segment] = []
-        var run: [LiveWord] = []
-        var runSpeaker: String?
-        func flush() {
-            out += LiveStream.lines(from: run, offset: 0, speaker: runSpeaker)
-            run = []
-        }
-        for w in words {
-            let s = label(w)
-            if s != runSpeaker, !run.isEmpty { flush() }
-            runSpeaker = s
-            run.append(w)
-        }
-        flush()
-        return (out, numbers.mapValues { "\(prefix) \($0)" })
+        return (segments, numbers.mapValues { "\(prefix) \($0)" })
     }
 
     /// 1 − normalized edit distance.
     static func similarity(_ a: String, _ b: String) -> Double { VocabularyGuard.similarity(a, b) }
 
-    static let hallucinations: Set<String> = ["thank you.", "thanks for watching!", "you", "[music]", "[blank_audio]"]
+    static let hallucinations = SpeakerPipeline.hallucinations
 
     private func publish(_ state: String) async {
         let loaded = loadedModel
