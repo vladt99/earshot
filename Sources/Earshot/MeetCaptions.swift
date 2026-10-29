@@ -22,7 +22,12 @@ final class MeetCaptionWatcher: @unchecked Sendable {
     private var region: AXUIElement?
     private var nextSearch = Date.distantPast
     private var lastText: [String: String] = [:]
-    private(set) var active = false
+    private let lock = NSLock()
+    private var reading = false
+    private var setManual = false
+
+    /// The captions region is found and being read (written on the captions queue, read on the main actor).
+    var active: Bool { lock.withLock { reading } }
 
     init?(bundleID: String, onHint: @escaping @Sendable (String) -> Void) {
         guard let pid = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first?.processIdentifier else { return nil }
@@ -32,10 +37,13 @@ final class MeetCaptionWatcher: @unchecked Sendable {
 
     static var trusted: Bool { AXIsProcessTrusted() }
 
-    /// Shows the system prompt once per launch of a meeting; afterwards the user grants it in System Settings.
+    /// Shows the system prompt once per build; afterwards the user grants it in System Settings. Each ad-hoc
+    /// signed build is a new identity the old grant doesn't cover, so a new build asks again (once).
     static func requestTrust() {
-        guard !trusted, !UserDefaults.standard.bool(forKey: "askedAccessibility") else { return }
-        UserDefaults.standard.set(true, forKey: "askedAccessibility")
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        guard !trusted, UserDefaults.standard.string(forKey: "askedAccessibilityBuild") != build else { return }
+        UserDefaults.standard.removeObject(forKey: "askedAccessibility")
+        UserDefaults.standard.set(build, forKey: "askedAccessibilityBuild")
         ask()
     }
 
@@ -47,8 +55,10 @@ final class MeetCaptionWatcher: @unchecked Sendable {
     }
 
     func start() {
-        // Chromium only builds the web accessibility tree for assistive apps that ask for it.
-        AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        // Chromium only builds the web accessibility tree for assistive apps that ask for it (costly, so stop() undoes it).
+        if attribute(app, "AXManualAccessibility") as? Bool != true {
+            setManual = AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue) == .success
+        }
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now() + 1, repeating: .milliseconds(500))
         t.setEventHandler { [weak self] in self?.poll() }
@@ -59,20 +69,26 @@ final class MeetCaptionWatcher: @unchecked Sendable {
     func stop() {
         timer?.cancel()
         timer = nil
+        let (app, setManual) = (app, setManual)
+        self.setManual = false
+        queue.async { [self] in
+            lock.withLock { reading = false }
+            if setManual { AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanFalse) }
+        }
     }
 
     private func poll() {
         guard Self.trusted else { return }
         if region == nil || attribute(region!, kAXRoleAttribute) == nil {
             region = nil
-            active = false
+            lock.withLock { reading = false }
             guard Date() >= nextSearch else { return }
             nextSearch = Date().addingTimeInterval(10)
             region = findRegion()
             if region != nil { LiveDebug.log("[captions] found Meet captions region") }
         }
         guard let region else { return }
-        active = true
+        lock.withLock { reading = true }
         // Region → (single-child wrappers) → one block per caption run: [name, text, text…].
         var node = region
         while case let kids = children(node), kids.count == 1 { node = kids[0] }

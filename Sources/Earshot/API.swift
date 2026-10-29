@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 /// Local REST API. Loopback only, bearer-token protected, browser origins rejected.
 /// The token and base URL are published in ~/Library/Application Support/Earshot/api.json.
@@ -9,16 +10,17 @@ enum API {
     static func start() {
         token = loadOrCreateToken()
         let port = Settings.port
-        let server = HTTPServer(port: port) { await handle($0) }
+        let server = HTTPServer(port: port, admit: admit) { await handle($0) }
         do {
             try server.start { error in
+                // api.json only advertises a server that actually owns the port.
+                if error == nil { writeInfo(port: port) } else { removeInfo() }
                 Task { @MainActor in
                     AppState.shared.serverError = error
                     AppState.shared.serverRunning = error == nil
                 }
             }
             self.server = server
-            writeInfo(port: port)
         } catch {
             Task { @MainActor in AppState.shared.serverError = "API server failed: \(error)" }
         }
@@ -26,20 +28,42 @@ enum API {
 
     // MARK: - Routing
 
-    static func handle(_ req: HTTPRequest) async -> HTTPResponse {
+    private static let uploadRoutes: Set<[String]> = [["v1", "audio", "transcriptions"], ["v1", "audio", "translations"], ["v1", "jobs"]]
+
+    /// Runs on the headers alone, so strangers never get a 100 Continue or a buffered body.
+    static func admit(_ req: HTTPRequest) -> HTTPServer.Admission {
         // DNS-rebinding and drive-by protection: only loopback hosts, never browser pages.
-        let host = (req.headers["host"] ?? "").split(separator: ":").first.map(String.init) ?? ""
-        guard ["127.0.0.1", "localhost", "[::1]", ""].contains(host) else { return .error(403, "Host not allowed") }
-        if let origin = req.headers["origin"], origin != "null" { return .error(403, "Browser origins are not allowed") }
+        guard ["127.0.0.1", "localhost", "[::1]", ""].contains(hostName(req.headers["host"] ?? "")) else {
+            return .reject(.error(403, "Host not allowed"))
+        }
+        // Local tools send neither; browsers always send one or the other (including "Origin: null").
+        if req.headers["origin"] != nil { return .reject(.error(403, "Browser origins are not allowed")) }
+        if let site = req.headers["sec-fetch-site"], site.lowercased() != "none" { return .reject(.error(403, "Browser requests are not allowed")) }
 
         let parts = req.path.split(separator: "/").map(String.init)
-        if req.method == "GET", parts == ["health"] || parts.isEmpty { return await health() }
-
-        let auth = req.headers["authorization"] ?? ""
-        let presented = auth.lowercased().hasPrefix("bearer ") ? String(auth.dropFirst(7)) : (req.headers["x-api-key"] ?? "")
-        guard !presented.isEmpty, constantTimeEquals(presented, token) else {
-            return .error(401, "Missing or invalid token. Read it from \(Paths.apiInfo.path)")
+        if !(req.method == "GET" && parts == ["health"]) {
+            let auth = req.headers["authorization"] ?? ""
+            let presented = auth.lowercased().hasPrefix("bearer ") ? String(auth.dropFirst(7)) : (req.headers["x-api-key"] ?? "")
+            guard !presented.isEmpty, constantTimeEquals(presented, token) else {
+                return .reject(.error(401, "Missing or invalid token. Read it from \(Paths.apiInfo.path)"))
+            }
         }
+        let upload = req.method == "POST" && uploadRoutes.contains(parts)
+        return .accept(maxBody: upload ? HTTPServer.maxBody : HTTPServer.smallBody,
+                       stream: req.method == "GET" && parts == ["v1", "events"])
+    }
+
+    private static func hostName(_ host: String) -> String {
+        let h = host.lowercased()
+        if h.hasPrefix("["), let end = h.firstIndex(of: "]") { return String(h[...end]) }
+        return h.split(separator: ":", omittingEmptySubsequences: false).first.map(String.init) ?? ""
+    }
+
+    static func handle(_ req: HTTPRequest) async -> HTTPResponse {
+        if case .reject(let r) = admit(req) { return r }
+        let parts = req.path.split(separator: "/").map(String.init)
+        // Only /health is open; `/` gives the same answer to authenticated callers.
+        if req.method == "GET", parts == ["health"] || parts.isEmpty { return await health() }
 
         do {
             switch (req.method, parts) {
@@ -127,7 +151,11 @@ enum API {
                 }
                 return .json(MeetingController.payload(snap), status: 201)
             case ("POST", ["v1", "meetings", "stop"]):
-                guard let t = await MeetingController.shared.stop() else { throw APIError(409, "No meeting in progress") }
+                let running = await MainActor.run { AppState.shared.meeting != nil }
+                guard let t = await MeetingController.shared.stop() else {
+                    guard running else { throw APIError(409, "No meeting in progress") }
+                    throw APIError(500, await MainActor.run { AppState.shared.lastError } ?? "The meeting could not be saved")
+                }
                 var d = Formats.verbose(t)
                 // The live transcript; the polished one follows as `meeting.finalized` (SSE/webhook).
                 d["polishing"] = Settings.polishAfterMeeting
@@ -208,7 +236,7 @@ enum API {
                 "version": appVersion,
                 "base_url": "http://127.0.0.1:\(Settings.port)",
                 "engine": ["state": s.engineState, "loaded_model": (loaded as Any?) ?? NSNull(),
-                           "speech_model": Engine.modelID] as [String: Any],
+                           "speech_model": Engine.modelID(for: Settings.language)] as [String: Any],
                 "language": Settings.language ?? "auto",
                 "downloads": s.downloads,
                 "jobs_active": active,
@@ -224,7 +252,7 @@ enum API {
             return ["id": m.id, "object": "model", "name": m.name, "purpose": m.purpose, "kind": m.kind.rawValue,
                     "repo": m.repo, "download_bytes": m.bytes, "installed": ModelCatalog.isInstalled(m),
                     "bytes_on_disk": bytes, "path": ModelCatalog.folder(m).path,
-                    "active": true] as [String: Any]
+                    "active": m.id != ModelCatalog.whisper.id || Engine.usesWhisper(language: Settings.language)] as [String: Any]
         }])
     }
 
@@ -245,7 +273,10 @@ enum API {
     private static func transcribeSync(_ req: HTTPRequest, translate: Bool) async throws -> HTTPResponse {
         var input = try await TranscriptionInput.parse(req)
         input.job.options.translate = translate
-        let job = await Jobs.shared.run(input.job)
+        var job = await Jobs.shared.run(input.job)
+        if translate, let t = job.transcript, t.language != "en" {
+            job.transcript = try await Translator.translate(t, to: "en")
+        }
         return try respond(job, format: input.format)
     }
 
@@ -297,17 +328,37 @@ enum API {
         if let data = try? Data(contentsOf: Paths.apiInfo),
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let t = obj["token"] as? String, t.count >= 32 { return t }
-        var bytes = [UInt8](repeating: 0, count: 32)
-        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        return randomHex(32)
+    }
+
+    /// `count` random bytes as hex, from the system CSPRNG.
+    static func randomHex(_ count: Int) -> String {
+        var bytes = [UInt8](repeating: 0, count: count)
+        if SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) != errSecSuccess {
+            arc4random_buf(&bytes, bytes.count) // same kernel CSPRNG, cannot fail
+        }
         return bytes.map { String(format: "%02x", $0) }.joined()
     }
 
     private static func writeInfo(port: UInt16) {
         let info: [String: Any] = ["base_url": "http://127.0.0.1:\(port)", "port": Int(port), "token": token,
                                    "version": appVersion, "pid": Int(ProcessInfo.processInfo.processIdentifier)]
-        if let data = try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]) {
-            FileManager.default.createFile(atPath: Paths.apiInfo.path, contents: data, attributes: [.posixPermissions: 0o600])
-        }
+        guard let data = try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]) else { return }
+        // Created 0600 from the start (no umask window), then renamed into place.
+        let tmp = Paths.apiInfo.deletingLastPathComponent().appendingPathComponent(".api.json.\(UUID().uuidString)")
+        let fd = open(tmp.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        guard fd >= 0 else { return }
+        let written = data.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+        close(fd)
+        if written != data.count || rename(tmp.path, Paths.apiInfo.path) != 0 { unlink(tmp.path) }
+    }
+
+    /// Removes api.json if this process wrote it.
+    private static func removeInfo() {
+        guard let data = try? Data(contentsOf: Paths.apiInfo),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              obj["pid"] as? Int == Int(ProcessInfo.processInfo.processIdentifier) else { return }
+        try? FileManager.default.removeItem(at: Paths.apiInfo)
     }
 }
 
@@ -322,15 +373,16 @@ struct TranscriptionInput {
         var title: String
         var sourcePath: String?
         var deleteAfter = false
+        var upload: (filename: String, data: Data)?
 
         if req.isMultipart {
             let mp = try req.multipart()
             fields = mp.fields
-            guard let upload = mp.files["file"] else { throw APIError(400, "Multipart body needs a 'file' part") }
-            let ext = (upload.filename as NSString).pathExtension
+            guard let part = mp.files["file"] else { throw APIError(400, "Multipart body needs a 'file' part") }
+            let ext = (part.filename as NSString).pathExtension
             file = Paths.uploads.appendingPathComponent(UUID().uuidString + (ext.isEmpty ? "" : ".\(ext)"))
-            try upload.data.write(to: file)
-            title = upload.filename
+            upload = part
+            title = part.filename
             deleteAfter = true
         } else {
             let body = req.jsonObject
@@ -354,16 +406,25 @@ struct TranscriptionInput {
         guard Formats.all.contains(format) else {
             throw APIError(400, "response_format must be one of \(Formats.all.joined(separator: ", "))")
         }
+        // Written only once the request is known to be valid; removed again if anything below fails.
+        var stored: URL?
+        defer { if let stored { try? FileManager.default.removeItem(at: stored) } }
+        if let upload {
+            stored = file
+            do { try upload.data.write(to: file) } catch { throw APIError(507, "Could not store the upload: \(error.localizedDescription)") }
+        }
         if let t = fields["title"], !t.isEmpty { title = t }
         var options = options(from: fields)
         options.translate = fields["translate"] == "true"
         options.diarize = fields["diarize"].map { $0 == "true" || $0 == "1" } ?? Settings.diarizeFiles
         let save = fields["save"].map { $0 != "false" } ?? true
-        return TranscriptionInput(
+        let input = TranscriptionInput(
             job: JobRequest(file: file, title: title, origin: "api", options: options,
                             save: save, deleteFileAfter: deleteAfter, sourcePath: sourcePath),
             format: format
         )
+        stored = nil
+        return input
     }
 
     /// `model` accepts a full id or a display name; OpenAI's "whisper-1" means "the selected model".
@@ -381,7 +442,7 @@ enum SettingsAPI {
     static func current() -> [String: Any] {
         [
             "language": Settings.language ?? "auto",
-            "speech_model": Engine.modelID,
+            "speech_model": Engine.modelID(for: Settings.language),
             "meeting_mode": Settings.meetingMode,
             "auto_stop_after_meeting": Settings.autoStopAfterMeeting,
             "auto_dismiss_meeting_alerts": Settings.autoDismissMeetingAlerts,

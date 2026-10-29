@@ -36,7 +36,13 @@ for b in "$BIN"/*.bundle(N); do cp -R "$b" "$APP/Contents/Resources/"; done
 SIGN_IDENTITY=-
 [[ -f .signing.env ]] && source .signing.env
 if [[ -n ${SIGN_KEYCHAIN:-} ]]; then
-  [[ -n ${SIGN_KEYCHAIN_PASSWORD_FILE:-} ]] && security unlock-keychain -p "$(cat $SIGN_KEYCHAIN_PASSWORD_FILE)" "$SIGN_KEYCHAIN"
+  if [[ -n ${SIGN_KEYCHAIN_PASSWORD_FILE:-} ]]; then
+    # Fed to `security -i` on stdin (print is a builtin), so the password never shows up in `ps`.
+    PW="$(<"$SIGN_KEYCHAIN_PASSWORD_FILE")"
+    PW=${PW//\\/\\\\}
+    print -r -- "unlock-keychain -p \"${PW//\"/\\\"}\" \"${SIGN_KEYCHAIN//\"/\\\"}\"" | security -i
+    unset PW
+  fi
   codesign --force --deep --sign "$SIGN_IDENTITY" --keychain "$SIGN_KEYCHAIN" "$APP"
 else
   codesign --force --deep --sign "$SIGN_IDENTITY" "$APP"

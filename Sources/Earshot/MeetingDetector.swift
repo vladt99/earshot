@@ -43,6 +43,11 @@ struct MeetingApp: Sendable {
     static func host(of bundleID: String) -> String {
         bundleID.hasPrefix("com.google.Chrome.app.") ? "com.google.Chrome" : bundleID
     }
+
+    /// Processes that carry an app's call audio: FaceTime's calls run in the avconferenced daemon.
+    static func audioProcesses(of bundleID: String) -> [String] {
+        bundleID == "com.apple.FaceTime" ? [bundleID, "com.apple.avconferenced"] : [bundleID]
+    }
 }
 
 struct DetectedMeeting: Equatable, Sendable {
@@ -73,8 +78,14 @@ final class MeetingDetector {
     private var pendingRelease: [String: Task<Void, Never>] = [:]
     private(set) var appsInMeeting: [String] = []
     private var ignored: Set<String> = []
+    private var everStarted = false
+    private var lastEvent = Date.distantPast
+    private var resyncTask: Task<Void, Never>?
 
     var current: DetectedMeeting? { appsInMeeting.first.map(Self.meeting(for:)) }
+
+    /// Calls in progress that the user hasn't chosen to ignore.
+    var activeMeetings: [DetectedMeeting] { appsInMeeting.filter { !ignored.contains($0) }.map(Self.meeting(for:)) }
 
     func start() {
         guard process == nil else { return }
@@ -82,26 +93,65 @@ final class MeetingDetector {
         p.executableURL = URL(fileURLWithPath: "/usr/bin/log")
         p.arguments = ["stream", "--style", "ndjson", "--predicate", Self.predicate]
         let pipe = Pipe()
+        let reader = pipe.fileHandleForReading
         p.standardOutput = pipe
         p.standardError = FileHandle.nullDevice
-        pipe.fileHandleForReading.readabilityHandler = { handle in
+        // Main queue, not a Task per chunk: chunks must be ingested in order.
+        reader.readabilityHandler = { handle in
             let data = handle.availableData
-            Task { @MainActor in MeetingDetector.shared.ingest(data) }
+            if data.isEmpty { handle.readabilityHandler = nil; return } // EOF
+            DispatchQueue.main.async { MainActor.assumeIsolated { MeetingDetector.shared.ingest(data) } }
         }
         p.terminationHandler = { proc in
-            Task { @MainActor in MeetingDetector.shared.streamEnded(status: proc.terminationStatus) }
+            reader.readabilityHandler = nil
+            let status = proc.terminationStatus
+            DispatchQueue.main.async { MainActor.assumeIsolated { MeetingDetector.shared.streamEnded(status: status) } }
         }
         do {
             try p.run()
             process = p
             startedAt = Date()
+            if everStarted { resync() }
+            everStarted = true
         } catch {
             AppState.shared.lastError = "Meeting detection could not start: \(error.localizedDescription)"
         }
     }
 
+    /// The stream was down: a hang-up in that window was never logged (ControlCenter only logs changes), so ask
+    /// Core Audio which of the apps still record. Two checks a few seconds apart, and only if no attribution
+    /// arrived meanwhile, so a device switch isn't taken for hanging up.
+    private func resync() {
+        resyncTask?.cancel()
+        let since = Date()
+        resyncTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { return }
+            let first = Self.recording(self.micHolders.union(self.appsInMeeting))
+            try? await Task.sleep(for: .seconds(4))
+            guard !Task.isCancelled, self.lastEvent < since else { return }
+            let known = self.micHolders.union(self.appsInMeeting)
+            let gone = known.subtracting(first).subtracting(Self.recording(known))
+            guard !gone.isEmpty else { return }
+            self.update(self.micHolders.subtracting(gone))
+            for id in self.appsInMeeting where gone.contains(id) && self.pendingRelease[id] == nil { self.released(id) }
+        }
+    }
+
+    /// Which of these apps (or their helper processes) currently take audio input.
+    static func recording(_ ids: Set<String>) -> Set<String> {
+        let inputs = AudioProcess.all().filter(\.isRunningInput)
+        return ids.filter { app in
+            MeetingApp.audioProcesses(of: app).contains { id in
+                let pids = Set(NSRunningApplication.runningApplications(withBundleIdentifier: id).map(\.processIdentifier))
+                return inputs.contains { pids.contains($0.pid) || $0.bundleID == id || $0.bundleID.hasPrefix(id + ".") }
+            }
+        }
+    }
+
     private func streamEnded(status: Int32) {
         process = nil
+        buffer = Data()
         // "Media-attribution log stream ended unexpectedly; respawning in Ns"
         if Date().timeIntervalSince(startedAt) > 60 { respawnDelay = 1 } else { respawnDelay = min(respawnDelay * 2, 30) }
         let delay = respawnDelay
@@ -119,7 +169,10 @@ final class MeetingDetector {
             buffer.removeSubrange(buffer.startIndex...nl)
             guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
                   let message = obj["eventMessage"] as? String else { continue }
-            if let holders = Self.micHolders(in: message) { update(holders) }
+            if let holders = Self.micHolders(in: message) {
+                lastEvent = Date()
+                update(holders)
+            }
         }
     }
 
@@ -174,7 +227,11 @@ final class MeetingDetector {
         appsInMeeting.removeAll { $0 == id }
         ignored.remove(id)
         let m = Self.meeting(for: id)
-        if AppState.shared.detectedMeeting?.key == id { AppState.shared.detectedMeeting = nil }
+        if AppState.shared.detectedMeeting?.key == id {
+            // A detected call that was never answered ended: take its prompt down.
+            AppState.shared.detectedMeeting = nil
+            if MeetingController.shared.session == nil, !MeetingController.shared.isStopping { MeetingPanel.shared.hide() }
+        }
         EventBus.shared.publish("meeting.ended_detected", ["app": m.appName, "app_bundle_id": id])
         MeetingController.shared.detectedMeetingEnded(m)
     }

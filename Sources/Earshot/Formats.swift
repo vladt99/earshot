@@ -47,10 +47,10 @@ enum Formats {
     static func markdown(_ t: Transcript) -> String {
         let speakers = Array(Set(t.segments.compactMap(\.speaker))).sorted()
         var out = "---\n"
-        out += "title: \"\(t.title.replacingOccurrences(of: "\"", with: "'"))\"\n"
+        out += "title: \(yaml(t.title))\n"
         out += "date: \(iso(t.createdAt))\n"
         if let d = t.duration { out += "duration: \(clock(d))\n" }
-        if !speakers.isEmpty { out += "participants: [\(speakers.map { "\"\($0)\"" }.joined(separator: ", "))]\n" }
+        if !speakers.isEmpty { out += "participants: [\(speakers.map(yaml).joined(separator: ", "))]\n" }
         out += "source: earshot\nid: \(t.id)\n---\n\n# \(t.title)\n\n"
         let notes = (t.notes ?? []).sorted { $0.time < $1.time }
         if !notes.isEmpty {
@@ -64,6 +64,13 @@ enum Formats {
         }
         out += paragraphs.map { who, start, text in "**\(clock(start))**\(who.map { " **\($0):**" } ?? "") \(text)" }.joined(separator: "\n\n")
         return out + "\n"
+    }
+
+    /// YAML double-quoted scalar.
+    static func yaml(_ s: String) -> String {
+        "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\r\n", with: "\\n").replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\n").replacingOccurrences(of: "\t", with: "\\t") + "\""
     }
 
     /// 0:42, 12:03, 1:02:09
@@ -107,8 +114,14 @@ enum Formats {
 
     static func vtt(_ t: Transcript) -> String {
         "WEBVTT\n\n" + t.segments.map { s in
-            "\(stamp(s.start, sep: ".")) --> \(stamp(s.end, sep: "."))\n\(s.speaker.map { "<v \($0)>" } ?? "")\(s.text)\n"
+            "\(stamp(s.start, sep: ".")) --> \(stamp(s.end, sep: "."))\n\(s.speaker.map { "<v \(cue($0))>" } ?? "")\(cue(s.text))\n"
         }.joined(separator: "\n")
+    }
+
+    /// WebVTT cue text: `&`, `<` and `>` are markup.
+    static func cue(_ s: String) -> String {
+        s.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;").replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\n", with: " ")
     }
 
     static func stamp(_ seconds: Double, sep: String) -> String {

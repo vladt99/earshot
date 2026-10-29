@@ -35,7 +35,7 @@ struct HTTPRequest: Sendable {
             if part.suffix(2) == Data("\r\n".utf8) { part = part.dropLast(2) }
             if let split = part.range(of: crlf2) {
                 let head = String(decoding: part[part.startIndex..<split.lowerBound], as: UTF8.self)
-                let data = Data(part[split.upperBound...])
+                let data = part[split.upperBound...] // a slice: no copy of big (file-mapped) uploads
                 let disposition = head.components(separatedBy: "\r\n")
                     .first { $0.lowercased().hasPrefix("content-disposition") } ?? ""
                 if let name = Self.param("name", in: disposition) {
@@ -105,30 +105,49 @@ struct HTTPResponse: Sendable {
 
 /// Minimal HTTP/1.1 server on the loopback interface. One request per connection.
 final class HTTPServer: @unchecked Sendable {
-    static let maxBody = 1 << 30 // 1 GiB; prefer {"path": …} for big local files
+    static let maxBody = 1 << 30 // 1 GiB, upload routes only; prefer {"path": …} for big local files
+    static let smallBody = 1 << 20
+    static let maxConnections = 32
+    static let maxStreams = 16
+
+    /// Decided as soon as the headers arrive, before any of the body is read.
+    enum Admission: Sendable {
+        case reject(HTTPResponse)
+        case accept(maxBody: Int, stream: Bool)
+    }
 
     let port: UInt16
-    private let handler: @Sendable (HTTPRequest) async -> HTTPResponse
+    fileprivate let admit: @Sendable (HTTPRequest) -> Admission
+    fileprivate let handler: @Sendable (HTTPRequest) async -> HTTPResponse
     private var listener: NWListener?
-    private let queue = DispatchQueue(label: "earshot.http")
+    fileprivate let queue = DispatchQueue(label: "earshot.http")
+    // Confined to `queue`.
+    fileprivate var connections = 0
+    fileprivate var streams = 0
 
-    init(port: UInt16, handler: @escaping @Sendable (HTTPRequest) async -> HTTPResponse) {
+    init(port: UInt16, admit: @escaping @Sendable (HTTPRequest) -> Admission,
+         handler: @escaping @Sendable (HTTPRequest) async -> HTTPResponse) {
         self.port = port
+        self.admit = admit
         self.handler = handler
     }
 
+    /// `onState(nil)` once the port is bound, `onState(message)` when it fails.
     func start(onState: @escaping @Sendable (String?) -> Void) throws {
         let params = NWParameters.tcp
-        params.allowLocalEndpointReuse = true
         params.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: NWEndpoint.Port(rawValue: port)!)
         let listener = try NWListener(using: params)
-        listener.newConnectionHandler = { [handler, queue] conn in
-            HTTPConnection(conn, queue: queue, handler: handler).start()
+        listener.newConnectionHandler = { [self] conn in
+            guard connections < Self.maxConnections else { HTTPConnection.refuse(conn, queue: queue); return }
+            connections += 1
+            HTTPConnection(conn, server: self).start()
         }
-        listener.stateUpdateHandler = { state in
+        listener.stateUpdateHandler = { [weak listener] state in
             switch state {
             case .ready: onState(nil)
-            case .failed(let e): onState("API server failed: \(e)")
+            case .failed(let e):
+                onState("API server failed: \(e)")
+                listener?.cancel()
             default: break
             }
         }
@@ -141,112 +160,282 @@ final class HTTPServer: @unchecked Sendable {
 
 private final class HTTPConnection: @unchecked Sendable {
     private let conn: NWConnection
-    private let queue: DispatchQueue
-    private let handler: @Sendable (HTTPRequest) async -> HTTPResponse
+    private let server: HTTPServer
+    private var queue: DispatchQueue { server.queue }
+    // Everything below is confined to `queue`.
     private var buffer = Data()
-    private var head: (request: HTTPRequest, bodyStart: Int, length: Int)?
+    private var head: HTTPRequest?
+    private var length = 0
+    private var received = 0
+    private var bodyFile: URL?
+    private var bodyHandle: FileHandle?
     private var sentContinue = false
+    private var isStream = false
+    private var isClosed = false
+    private var responded = false
+    private var timer: DispatchSourceTimer?
+    /// Header read: 10 s; body: 30 s without progress; response write: 60 s.
+    private var deadline = DispatchTime.now() + .seconds(10)
+    private var pump: Task<Void, Never>?
 
-    init(_ conn: NWConnection, queue: DispatchQueue, handler: @escaping @Sendable (HTTPRequest) async -> HTTPResponse) {
+    init(_ conn: NWConnection, server: HTTPServer) {
         self.conn = conn
-        self.queue = queue
-        self.handler = handler
+        self.server = server
+    }
+
+    static func refuse(_ conn: NWConnection, queue: DispatchQueue) {
+        conn.start(queue: queue)
+        conn.send(content: HTTPResponse.error(503, "Too many connections").serialized(), completion: .contentProcessed { _ in conn.cancel() })
+        queue.asyncAfter(deadline: .now() + 5) { conn.cancel() }
     }
 
     func start() {
+        conn.stateUpdateHandler = { [self] state in
+            switch state {
+            case .failed, .cancelled: closed()
+            default: break
+            }
+        }
         conn.start(queue: queue)
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(250))
+        t.setEventHandler { [self] in if DispatchTime.now() > deadline { conn.cancel() } }
+        t.resume()
+        timer = t
         receive()
     }
 
+    private func closed() {
+        guard !isClosed else { return }
+        isClosed = true
+        timer?.cancel()
+        timer = nil
+        pump?.cancel()
+        dropBodyFile()
+        if isStream { server.streams -= 1 } else { server.connections -= 1 }
+        conn.stateUpdateHandler = nil
+    }
+
     private func receive() {
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { [self] data, _, done, error in
-            if let data { buffer.append(data) }
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { [self] data, _, eof, error in
+            guard !isClosed, !responded else { return }
             if error != nil { conn.cancel(); return }
-            process(eof: done)
+            process(data, eof: eof)
         }
     }
 
-    private func process(eof: Bool) {
+    private func process(_ data: Data?, eof: Bool) {
         if head == nil {
+            if let data { buffer.append(data) }
             guard let end = buffer.range(of: Data("\r\n\r\n".utf8)) else {
-                if eof || buffer.count > 64 * 1024 { finish(.error(400, "Bad request")) } else { receive() }
+                if eof || buffer.count > 64 * 1024 { respond(.error(400, "Bad request")) } else { receive() }
                 return
             }
-            guard let parsed = parseHead(String(decoding: buffer[..<end.lowerBound], as: UTF8.self)) else {
-                finish(.error(400, "Bad request")); return
-            }
-            if parsed.headers["transfer-encoding"]?.lowercased().contains("chunked") == true {
-                finish(.error(411, "Chunked uploads are not supported; send Content-Length")); return
-            }
-            let length = Int(parsed.headers["content-length"] ?? "0") ?? 0
-            if length > HTTPServer.maxBody { finish(.error(413, "Body too large")); return }
-            head = (parsed, end.upperBound, length)
-        }
-        guard let head else { return }
-        if buffer.count - head.bodyStart >= head.length {
-            var req = head.request
-            req.body = buffer.subdata(in: head.bodyStart..<(head.bodyStart + head.length))
+            let rest = Data(buffer[end.upperBound...])
+            let text = String(decoding: buffer[..<end.lowerBound], as: UTF8.self)
             buffer = Data()
-            Task { [self] in finish(await handler(req)) }
-        } else if eof {
-            conn.cancel()
-        } else {
-            // curl waits for this before sending large multipart uploads.
-            if !sentContinue, head.request.headers["expect"]?.lowercased() == "100-continue" {
-                sentContinue = true
-                conn.send(content: Data("HTTP/1.1 100 Continue\r\n\r\n".utf8), completion: .contentProcessed { _ in })
+            guard let parsed = parseHead(text) else { respond(.error(400, "Bad request")); return }
+            let (req, lengths) = parsed
+            // Auth, Host and Origin are checked before anything else is read or a 100 Continue goes out.
+            let limit: Int
+            switch server.admit(req) {
+            case .reject(let r): respond(r); return
+            case .accept(let max, let stream):
+                limit = max
+                if stream {
+                    guard server.streams < HTTPServer.maxStreams else { respond(.error(503, "Too many event streams")); return }
+                    server.connections -= 1
+                    server.streams += 1
+                    isStream = true
+                }
             }
-            receive()
+            if let te = req.headers["transfer-encoding"], te.lowercased() != "identity" {
+                respond(.error(411, "Chunked uploads are not supported; send Content-Length")); return
+            }
+            guard let n = Self.contentLength(lengths) else { respond(.error(400, "Invalid Content-Length")); return }
+            guard n <= limit else { respond(.error(413, "Body too large")); return }
+            head = req
+            length = n
+            deadline = .now() + 30
+            if n > HTTPServer.smallBody {
+                // Big uploads go to disk, not RAM.
+                let file = Paths.uploads.appendingPathComponent("body-" + UUID().uuidString)
+                guard FileManager.default.createFile(atPath: file.path, contents: nil, attributes: [.posixPermissions: 0o600]),
+                      let h = try? FileHandle(forWritingTo: file) else { respond(.error(507, "Could not buffer the upload")); return }
+                bodyFile = file
+                bodyHandle = h
+            } else {
+                buffer.reserveCapacity(n)
+            }
+            if !rest.isEmpty, !append(rest) { return }
+        } else if let data, !data.isEmpty {
+            guard append(data) else { return }
+            deadline = .now() + 30
+        }
+        if received >= length { complete(); return }
+        if eof { conn.cancel(); return }
+        // curl waits for this before sending large multipart uploads.
+        if !sentContinue, head?.headers["expect"]?.lowercased() == "100-continue" {
+            sentContinue = true
+            conn.send(content: Data("HTTP/1.1 100 Continue\r\n\r\n".utf8), completion: .contentProcessed { _ in })
+        }
+        receive()
+    }
+
+    private func append(_ data: Data) -> Bool {
+        let chunk = data.prefix(length - received)
+        received += chunk.count
+        guard let h = bodyHandle else { buffer.append(chunk); return true }
+        do { try h.write(contentsOf: chunk) } catch {
+            respond(.error(507, "Could not buffer the upload"))
+            return false
+        }
+        return true
+    }
+
+    private func complete() {
+        guard var req = head else { return }
+        deadline = .distantFuture // transcribing can take minutes
+        if let file = bodyFile {
+            try? bodyHandle?.close()
+            bodyHandle = nil
+            // Mapped, so a 1 GiB upload isn't read into memory; the mapping outlives the unlink.
+            req.body = (try? Data(contentsOf: file, options: .alwaysMapped)) ?? Data()
+            dropBodyFile()
+        } else {
+            req.body = buffer
+        }
+        buffer = Data()
+        let handler = server.handler
+        Task { [self] in
+            let response = await handler(req)
+            queue.async { [self] in respond(response) }
         }
     }
 
-    private func parseHead(_ text: String) -> HTTPRequest? {
+    private func dropBodyFile() {
+        try? bodyHandle?.close()
+        bodyHandle = nil
+        if let f = bodyFile { try? FileManager.default.removeItem(at: f) }
+        bodyFile = nil
+    }
+
+    /// One Content-Length, digits only; nil means 400.
+    private static func contentLength(_ values: [String]) -> Int? {
+        guard values.count <= 1 else { return nil }
+        guard let v = values.first else { return 0 }
+        guard !v.isEmpty, v.utf8.count <= 18, v.utf8.allSatisfy({ $0 >= 0x30 && $0 <= 0x39 }) else { return nil }
+        return Int(v)
+    }
+
+    private func parseHead(_ text: String) -> (HTTPRequest, [String])? {
         var lines = text.components(separatedBy: "\r\n")
         let parts = lines.removeFirst().split(separator: " ")
         guard parts.count >= 2 else { return nil }
         var headers: [String: String] = [:]
+        var lengths: [String] = []
         for line in lines {
             guard let colon = line.firstIndex(of: ":") else { continue }
-            headers[line[..<colon].lowercased()] = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            let name = line[..<colon].lowercased().trimmingCharacters(in: .whitespaces)
+            let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            if name == "content-length" { lengths.append(value) }
+            headers[name] = value
         }
         let comps = URLComponents(string: String(parts[1]))
         var query: [String: String] = [:]
         for item in comps?.queryItems ?? [] { query[item.name] = item.value ?? "" }
-        return HTTPRequest(method: String(parts[0]).uppercased(), path: comps?.path ?? "/", query: query, headers: headers, body: Data())
+        let req = HTTPRequest(method: String(parts[0]).uppercased(), path: comps?.path ?? "/", query: query, headers: headers, body: Data())
+        return (req, lengths)
     }
 
-    private func finish(_ response: HTTPResponse) {
+    private func respond(_ response: HTTPResponse) {
+        guard !isClosed, !responded else { return }
+        responded = true
         guard let stream = response.stream else {
+            deadline = .now() + 60
             conn.send(content: response.serialized(), completion: .contentProcessed { [conn] _ in conn.cancel() })
             return
         }
+        deadline = .distantFuture
         conn.send(content: response.serialized(), completion: .contentProcessed { _ in })
-        let pump = Task { [conn] in
+        let gate = SendGate()
+        pump = Task { [conn] in
             let heartbeat = Task {
                 while !Task.isCancelled {
                     try? await Task.sleep(for: .seconds(15))
-                    conn.send(content: Data(": ping\n\n".utf8), completion: .contentProcessed { _ in })
+                    // A client that hasn't read anything for a minute is gone.
+                    if gate.stalled(longerThan: 60) { conn.cancel(); return }
+                    if !gate.busy { await Self.send(Data(": ping\n\n".utf8), on: conn, gate) }
                 }
             }
+            // Each send is awaited, so a slow reader backs up into the stream's bounded buffer
+            // (oldest events dropped) instead of growing the connection's queue.
             for await chunk in stream {
-                conn.send(content: chunk, completion: .contentProcessed { _ in })
+                await Self.send(chunk, on: conn, gate)
+                if Task.isCancelled { break }
             }
             heartbeat.cancel()
             conn.cancel()
         }
-        conn.stateUpdateHandler = { state in
-            switch state {
-            case .failed, .cancelled: pump.cancel()
-            default: break
-            }
-        }
         // Detect the client hanging up (a read returning EOF).
-        watchForClose(pump)
+        watchForClose()
     }
 
-    private func watchForClose(_ pump: Task<Void, Never>) {
+    private static func send(_ data: Data, on conn: NWConnection, _ gate: SendGate) async {
+        gate.begin()
+        defer { gate.end() }
+        let once = Once()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                once.set(c)
+                conn.send(content: data, completion: .contentProcessed { _ in once.resume() })
+            }
+        } onCancel: { once.resume() }
+    }
+
+    private func watchForClose() {
         conn.receive(minimumIncompleteLength: 1, maximumLength: 1024) { [self] _, _, done, error in
-            if done || error != nil { pump.cancel(); conn.cancel() } else { watchForClose(pump) }
+            if done || error != nil { pump?.cancel(); conn.cancel() } else if !isClosed { watchForClose() }
         }
+    }
+}
+
+/// Pending SSE writes, to spot a client that stopped reading.
+private final class SendGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending = 0
+    private var since: Date?
+
+    var busy: Bool { lock.withLock { pending > 0 } }
+
+    func begin() { lock.withLock { if pending == 0 { since = Date() }; pending += 1 } }
+    func end() { lock.withLock { pending -= 1; if pending == 0 { since = nil } } }
+    func stalled(longerThan seconds: TimeInterval) -> Bool {
+        lock.withLock { since.map { Date().timeIntervalSince($0) > seconds } ?? false }
+    }
+}
+
+/// Resumes a continuation exactly once (send completion or task cancellation, whichever comes first).
+private final class Once: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var done = false
+
+    func set(_ c: CheckedContinuation<Void, Never>) {
+        let resumeNow = lock.withLock { () -> Bool in
+            if done { return true }
+            continuation = c
+            return false
+        }
+        if resumeNow { c.resume() }
+    }
+
+    func resume() {
+        let c = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            done = true
+            defer { continuation = nil }
+            return continuation
+        }
+        c?.resume()
     }
 }

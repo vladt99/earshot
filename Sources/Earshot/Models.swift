@@ -70,14 +70,20 @@ enum ModelCatalog {
     /// Only downloaded once the user adds Custom Vocabulary words.
     static let vocabulary = ModelInfo(id: "parakeet-ctc-110m", name: "Parakeet CTC 110M", purpose: "Custom vocabulary (names, project terms)",
                                       kind: .vocabulary, bytes: 100_000_000, repo: "FluidInference/parakeet-ctc-110m-coreml")
+    /// Only downloaded once a language other than English is picked (or from Settings / the API).
+    static let whisper = ModelInfo(id: "whisper-large-v3-turbo", name: "Whisper large-v3-turbo",
+                                   purpose: "Transcription in 99 languages (used for non-English)",
+                                   kind: .speech, bytes: 1_620_000_000, repo: "argmaxinc/whisperkit-coreml")
+    static let whisperVariant = "openai_whisper-large-v3-v20240930"
     /// Downloaded on first launch.
     static let speech = [parakeet, diarizer, echo]
-    static let all = speech + [vocabulary]
+    static let all = speech + [vocabulary, whisper]
 
     static func find(_ id: String) -> ModelInfo? { all.first { $0.id == id || $0.repo == id || $0.name == id } }
 
     /// Where each model lives once downloaded.
     static func folder(_ m: ModelInfo) -> URL {
+        if m.id == whisper.id { return whisperKitModels }
         // FluidAudio stores most repos without the "-coreml" suffix, but the CTC models keep it.
         let name = String(m.repo.split(separator: "/").last ?? "")
         let full = fluidAudioModels.appendingPathComponent(name)
@@ -89,17 +95,36 @@ enum ModelCatalog {
             .appendingPathComponent("FluidAudio/Models", isDirectory: true)
     }
 
+    /// WhisperKit's Hugging Face cache, Earshot's own (never another app's).
+    static var whisperKitModels: URL { Paths.support.appendingPathComponent("Models/whisperkit", isDirectory: true) }
+
+    static var whisperFolder: URL {
+        whisperKitModels.appendingPathComponent("models/\(whisper.repo)/\(whisperVariant)", isDirectory: true)
+    }
+
+    /// Files land in place only once fully downloaded.
+    static var whisperComplete: Bool {
+        ["MelSpectrogram", "AudioEncoder", "TextDecoder"].allSatisfy { name in
+            ["coremldata.bin", "weights/weight.bin"].allSatisfy {
+                FileManager.default.fileExists(atPath: whisperFolder.appendingPathComponent("\(name).mlmodelc/\($0)").path)
+            }
+        }
+    }
+
     static func installedBytes(_ m: ModelInfo) -> Int64 { size(of: folder(m)) }
 
     static func isInstalled(_ m: ModelInfo) -> Bool {
+        if m.id == whisper.id, !whisperComplete { return false }
         // Partial downloads are smaller; consider a model present at 90 % of its published size.
-        installedBytes(m) >= m.bytes * 9 / 10
+        return installedBytes(m) >= m.bytes * 9 / 10
     }
 
-    static func size(of dir: URL) -> Int64 {
+    /// Bytes on disk, not counting interrupted downloads (`*.partial`, `*.incomplete`) unless `partial`.
+    static func size(of dir: URL, partial: Bool = false) -> Int64 {
         var total: Int64 = 0
         let e = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: [.totalFileAllocatedSizeKey, .isSymbolicLinkKey])
         while let u = e?.nextObject() as? URL {
+            if !partial, ["partial", "incomplete"].contains(u.pathExtension) { e?.skipDescendants(); continue }
             let v = try? u.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .isSymbolicLinkKey])
             if v?.isSymbolicLink == true { continue }
             total += Int64(v?.totalFileAllocatedSize ?? 0)

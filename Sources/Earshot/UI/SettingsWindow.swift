@@ -75,7 +75,7 @@ struct SwitchRow: View {
         HStack(alignment: .firstTextBaseline) {
             Text(title).fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 20)
-            Toggle("", isOn: $isOn).toggleStyle(.switch).labelsHidden()
+            Toggle(title, isOn: $isOn).toggleStyle(.switch).labelsHidden()
         }
     }
 }
@@ -101,6 +101,7 @@ private struct SettingsPage: View {
     @State private var tick = 0
     @State private var newItem = ""
     @State private var newReplace = ""
+    @State private var batchExport = false
 
     var body: some View {
         @Bindable var state = state
@@ -110,9 +111,25 @@ private struct SettingsPage: View {
             GlassGroup {
                 toggle("Play sound when finished", Settings.playSoundWhenFinished) { Settings.playSoundWhenFinished = $0 }
                 SwitchRow(title: "Launch at login", isOn: $state.launchAtLogin)
+                if state.launchAtLoginNeedsApproval {
+                    HStack {
+                        Label("Approve Earshot in System Settings → General → Login Items", systemImage: "exclamationmark.circle")
+                            .foregroundStyle(.orange)
+                        Spacer()
+                        Button("Open Login Items") {
+                            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension")!)
+                        }
+                        .buttonStyle(.glass)
+                    }
+                    .font(.callout)
+                }
                 Picker("Default language", selection: $state.language) {
                     ForEach(LanguageMenu.languages, id: \.0) { Text($0.1).tag($0.0) }
                 }
+                if state.usesWhisper {
+                    ModelRow(model: ModelCatalog.whisper)
+                }
+                note(LanguageMenu.whisperNote + "; English and Auto Detect use Parakeet.")
             }
         case "Appearance":
             GlassGroup(title: "Theme") {
@@ -125,7 +142,7 @@ private struct SettingsPage: View {
             }
             GlassGroup(title: "Background") {
                 HStack(spacing: 14) {
-                    if let img = Backdrop.image(version: state.backgroundVersion) {
+                    if let img = BackdropModel.shared.image {
                         Image(nsImage: img).resizable().scaledToFill().frame(width: 200, height: 124).clipShape(RoundedRectangle(cornerRadius: 12))
                     }
                     VStack(alignment: .leading, spacing: 10) {
@@ -140,7 +157,8 @@ private struct SettingsPage: View {
                 }
                 HStack {
                     Text("Dim")
-                    Slider(value: Binding(get: { Settings.backgroundDim }, set: { Settings.backgroundDim = $0; state.backgroundVersion += 1 }), in: 0...0.8)
+                    Slider(value: Binding(get: { BackdropModel.shared.dim }, set: { BackdropModel.shared.dim = $0 }), in: 0...0.8)
+                        .accessibilityLabel("Dim")
                 }
             }
             GlassGroup(title: "Transcript") {
@@ -194,12 +212,18 @@ private struct SettingsPage: View {
         case "Live Captions":
             GlassGroup {
                 note("Live Captions transcribe your microphone and all system audio in a floating window without saving anything.")
-                Button(state.meeting?.platform == "Live Captions" ? "Stop Live Captions" : "Start Live Captions") { state.toggleLiveCaptions() }.buttonStyle(.glassProminent)
+                let busy = state.meeting != nil && state.meeting?.platform != "Live Captions"
+                Button(state.meeting?.platform == "Live Captions" ? "Stop Live Captions" : "Start Live Captions") { state.toggleLiveCaptions() }
+                    .buttonStyle(.glassProminent).disabled(busy)
+                    .help(busy ? "Stop the current recording first" : "")
             }
         case "Dictation":
             GlassGroup {
                 toggle("Copy dictated text to the clipboard", Settings.copyDictationToClipboard) { Settings.copyDictationToClipboard = $0 }
-                Button(state.recordingKind == "dictation" ? "Stop Dictation" : "Try Dictation") { state.toggleDictation() }.buttonStyle(.glassProminent)
+                let memo = state.recordingKind == "voicememo"
+                Button(state.recordingKind == "dictation" ? "Stop Dictation" : "Try Dictation") { state.toggleDictation() }
+                    .buttonStyle(.glassProminent).disabled(memo)
+                    .help(memo ? "A voice memo is recording; stop it first" : "")
                 note("Start and stop dictation from the menu bar, the API (POST /v1/dictation/start|stop) or earshot://dictation/toggle.")
             }
         case "Record Meetings":
@@ -231,7 +255,7 @@ private struct SettingsPage: View {
             }
         case "Translation":
             GlassGroup {
-                note("Translate any transcript from its inspector. Whisper translates to English during transcription (API: /v1/audio/translations); other languages use Apple's on-device Translation — install language pairs in System Settings → General → Language & Region → Translation Languages.")
+                note("Translate any finished transcript with Translate… in its inspector; the translation is saved as a new transcript. Translating is a separate step on this Mac with Apple's Translation (API: POST /v1/transcripts/{id}/translate). POST /v1/audio/translations translates to English: with Whisper (any language but English) in the same pass, otherwise with Apple's Translation after Parakeet. Install language pairs in System Settings → General → Language & Region → Translation Languages.")
             }
         case "Ignored Segments":
             listEditor(Settings.ignoredSegments, placeholder: "Segment text to ignore, e.g. “Thank you for watching.”") {
@@ -286,9 +310,10 @@ private struct SettingsPage: View {
             }
         case "Batch Export":
             GlassGroup {
-                note("Export many transcripts at once from the Batch Export tile on Home.")
-                Button("Export All Transcripts…") { state.showBatchExport = true }.buttonStyle(.glassProminent)
+                note("Export every transcript in your library at once: pick the formats, then a folder. One file per transcript and format.")
+                Button("Export All Transcripts…") { batchExport = true }.buttonStyle(.glassProminent)
             }
+            .sheet(isPresented: $batchExport) { BatchExportSheet(items: state.transcripts) }
         case "Integrations":
             GlassGroup(title: "Local API") {
                 LabeledContent("Base URL") { Text(state.baseURL).textSelection(.enabled) }
@@ -313,7 +338,7 @@ private struct SettingsPage: View {
         default:
             GlassGroup {
                 Text("Earshot \(appVersion)").font(.title2.bold())
-                note("On-device meeting and audio transcription for macOS, with a local API for your other apps. Engine: FluidAudio (Parakeet v3, pyannote, LocalVQE).")
+                note("On-device meeting and audio transcription for macOS, with a local API for your other apps. Engines: FluidAudio (Parakeet v3, pyannote, LocalVQE) and WhisperKit (Whisper large-v3-turbo).")
                 Button("Open README") { state.openSupport() }.buttonStyle(.glass)
             }
         }
@@ -347,7 +372,7 @@ private struct SettingsPage: View {
 
 private struct MeetingSettings: View {
     @Environment(AppState.self) private var state
-    @State private var mode = Settings.meetingMode
+    @AppStorage("meetingMode") private var mode = "ask"
     @State private var apps = Set(Settings.meetingApps)
     @State private var tick = 0
 
@@ -359,7 +384,6 @@ private struct MeetingSettings: View {
                 Text("Record automatically").tag("auto")
                 Text("Do nothing").tag("off")
             }
-            .onChange(of: mode) { Settings.meetingMode = mode }
             row("Stop recording 10 seconds after a meeting ends. Dismiss the alert to keep recording.", Settings.autoStopAfterMeeting) { Settings.autoStopAfterMeeting = $0 }
             row("Automatically dismiss detected meeting alerts after 10 seconds", Settings.autoDismissMeetingAlerts) { Settings.autoDismissMeetingAlerts = $0 }
             row("Speaker detection (Speaker 1, 2, … for the other participants)", Settings.diarizeMeetings) { Settings.diarizeMeetings = $0 }
@@ -381,6 +405,10 @@ private struct MeetingSettings: View {
             Text("A meeting is detected when one of these apps starts using the microphone (the orange dot). For browsers that means any site using the mic, e.g. Google Meet.")
                 .font(.callout).foregroundStyle(.secondary)
         }
+        .onAppear { apps = Set(Settings.meetingApps); tick += 1 }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
+            apps = Set(Settings.meetingApps); tick += 1
+        }
     }
 
     private func row(_ title: String, _ value: Bool, _ set: @escaping (Bool) -> Void) -> some View {
@@ -394,12 +422,20 @@ private struct LocalModelsPage: View {
     var body: some View {
         let used = state.modelBytes.values.reduce(0, +)
         GlassGroup(title: "FluidAudio") {
-            ForEach(ModelCatalog.all) { ModelRow(model: $0) }
+            ForEach(ModelCatalog.all.filter { $0.id != ModelCatalog.whisper.id }) { ModelRow(model: $0) }
+        }
+        GlassGroup(title: "WhisperKit") {
+            ModelRow(model: ModelCatalog.whisper)
+            Text(LanguageMenu.whisperNote + ". It downloads the first time one is picked.")
+                .font(.callout).foregroundStyle(.secondary)
         }
         GlassGroup {
             LabeledContent("Storage used") { Text(ByteCountFormatter.string(fromByteCount: used, countStyle: .file)).monospacedDigit() }
             HStack {
                 Button("Show Speech Models") { NSWorkspace.shared.open(ModelCatalog.fluidAudioModels) }.buttonStyle(.glass)
+                if (state.modelBytes[ModelCatalog.whisper.id] ?? 0) > 0 {
+                    Button("Show Whisper") { NSWorkspace.shared.open(ModelCatalog.whisperKitModels) }.buttonStyle(.glass)
+                }
             }
             Text("Nothing ships with the app. The speech models (≈ 525 MB) download on first launch.")
                 .font(.callout).foregroundStyle(.secondary)
@@ -451,18 +487,31 @@ private struct NoteTakerSettings: View {
             row("Name speakers from Google Meet captions", Settings.autoNameSpeakers) { Settings.autoNameSpeakers = $0 }
             TimelineView(.periodic(from: .now, by: 2)) { _ in
                 let trusted = MeetCaptionWatcher.trusted
-                HStack {
-                    Image(systemName: trusted ? "checkmark.circle.fill" : "exclamationmark.circle")
-                        .foregroundStyle(trusted ? .green : .orange)
-                    Text(trusted ? "Accessibility access granted" : "Needs Accessibility access to read Meet's captions")
-                    Spacer()
-                    if !trusted {
-                        Button("Grant Access…") { MeetCaptionWatcher.ask() }.buttonStyle(.glass)
+                // Granted before (or asked for and maybe switched on) but not trusted now: an update with a new
+                // signature keeps the old entry in the list without it applying to this build.
+                let stale = !trusted && (UserDefaults.standard.bool(forKey: Self.grantedKey) || state.meeting?.captionsNeedAccess == true)
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Image(systemName: trusted ? "checkmark.circle.fill" : "exclamationmark.circle")
+                            .foregroundStyle(trusted ? .green : .orange)
+                        Text(trusted ? "Accessibility access granted" : stale ? "Accessibility access isn't active" : "Needs Accessibility access to read Meet's captions")
+                        Spacer()
+                        if stale {
+                            Button("Open Accessibility Settings") {
+                                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+                            }
+                            .buttonStyle(.glass)
+                        } else if !trusted {
+                            Button("Grant Access…") { MeetCaptionWatcher.ask() }.buttonStyle(.glass)
+                        }
+                    }
+                    if stale {
+                        note("Access isn't active for this version — remove Earshot from the list in System Settings → Privacy & Security → Accessibility and add it again.")
+                    } else if !trusted {
+                        note("Click Grant Access, then switch on Earshot in the list (it's listed as Earshot, not Note Taker). If it still isn't there, click + under the list and choose Earshot.app. If Earshot is already switched on, an update can leave the old grant inactive: remove it with − and add it again.")
                     }
                 }
-            }
-            if !MeetCaptionWatcher.trusted {
-                note("Click Grant Access, then switch on Earshot in the list (it's listed as Earshot, not Note Taker). If it still isn't there, click + under the list and choose Earshot.app.")
+                .task(id: trusted) { if trusted { UserDefaults.standard.set(true, forKey: Self.grantedKey) } }
             }
             note("Turn on captions (CC) in Meet. Meet shows each caption under the speaker's name; Earshot uses that only to put names on Speaker 1, 2, …. Captions text is not used and nothing leaves your Mac.")
             row("Remember voices and recognise people in later meetings", Settings.rememberVoices) { Settings.rememberVoices = $0 }
@@ -488,12 +537,14 @@ private struct NoteTakerSettings: View {
         }
     }
 
+    static let grantedKey = "accessibilityGrantedOnce"
+
     private func row(_ title: String, _ value: Bool, _ set: @escaping (Bool) -> Void) -> some View {
         SwitchRow(title: title, isOn: Binding(get: { value }, set: { set($0); tick += 1 }))
     }
 
     private func note(_ text: String) -> some View {
-        Text(text).font(.callout).foregroundStyle(.secondary)
+        Text(text).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -515,12 +566,13 @@ private struct VocabularySettings: View {
                     Text(w)
                     Spacer()
                     Button { words.removeAll { $0 == w }; save() } label: { Image(systemName: "minus.circle") }.buttonStyle(.plain)
+                        .help("Remove").accessibilityLabel("Remove \(w)")
                 }
             }
         }
         GlassGroup(title: "Model") {
             ModelRow(model: ModelCatalog.vocabulary)
-            Text("Needs Parakeet CTC 110M (≈ 100 MB). It downloads when you add the first word.").font(.callout).foregroundStyle(.secondary)
+            Text("Needs Parakeet CTC 110M (≈ 100 MB). It downloads when you add the first word. Whisper (languages other than English) gets the words as its prompt instead.").font(.callout).foregroundStyle(.secondary)
         }
     }
 
@@ -546,11 +598,22 @@ private struct WebhookSettings: View {
     @State private var urls = Settings.webhooks
     @State private var events = Set(Settings.webhookEvents)
     @State private var newURL = ""
+    @State private var secret = Webhooks.secret
     static let choices = ["meeting.finalized", "meeting.saved", "meeting.started", "meeting.note", "meeting.warning", "job.done", "job.failed"]
 
     var body: some View {
         GlassGroup(title: "Webhooks") {
-            Text("POST these events to other apps (a dashboard, a script, an agent). meeting.finalized and job.done include the full transcript. Each request is signed: X-Earshot-Signature = sha256 HMAC of the body, keyed with the API token.")
+            Text("POST these events to other apps (a dashboard, a script, an agent). meeting.finalized and job.done include the full transcript.")
+                .font(.callout).foregroundStyle(.secondary)
+            LabeledContent("Signing secret") {
+                HStack {
+                    Text(secret).font(.system(.callout, design: .monospaced)).textSelection(.enabled).lineLimit(1).truncationMode(.middle)
+                    Button("Copy") { AppState.shared.copy(secret) }.buttonStyle(.glass)
+                    Button("Rotate") { Webhooks.rotateSecret(); secret = Webhooks.secret }.buttonStyle(.glass)
+                        .help("Make a new secret; receivers need the new one")
+                }
+            }
+            Text("Receivers verify X-Earshot-Signature (HMAC-SHA256 of the body) with this secret. Rotating it invalidates the old one.")
                 .font(.callout).foregroundStyle(.secondary)
             HStack {
                 TextField("http://127.0.0.1:3000/hooks/earshot", text: $newURL).onSubmit(add)
@@ -561,6 +624,7 @@ private struct WebhookSettings: View {
                     Text(u).font(.system(.callout, design: .monospaced))
                     Spacer()
                     Button { urls.removeAll { $0 == u }; Settings.webhooks = urls } label: { Image(systemName: "minus.circle") }.buttonStyle(.plain)
+                        .help("Remove").accessibilityLabel("Remove \(u)")
                 }
             }
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 170))], alignment: .leading, spacing: 6) {

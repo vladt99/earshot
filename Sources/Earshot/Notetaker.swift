@@ -22,6 +22,8 @@ struct MeetingManifest: Codable {
     var language: String?
     var notes: [Note] = []
     var speakerHints: [SpeakerHint] = []
+    /// A session that is never saved (Live Captions): recovery deletes its folder.
+    var discard: Bool? = nil
     var saved = false
 
     static func url(_ folder: URL) -> URL { folder.appendingPathComponent("meeting.json") }
@@ -129,17 +131,24 @@ enum MeetingRecovery {
     static func run() async {
         let folders = (try? FileManager.default.contentsOfDirectory(at: Paths.meetings, includingPropertiesForKeys: nil)) ?? []
         for folder in folders {
-            guard let m = MeetingManifest.read(folder), !m.saved, Store.shared.get(m.id) == nil,
-                  MeetingController.shared.session?.folder != folder else { continue }
+            guard let m = MeetingManifest.read(folder), !m.saved, !MeetingController.shared.owns(folder) else { continue }
+            if m.discard == true {
+                try? FileManager.default.removeItem(at: folder)
+                continue
+            }
+            guard Store.shared.get(m.id) == nil else { continue }
             let tracks = ["others.wav", "me.wav"].map { folder.appendingPathComponent($0) }
                 .filter { FileManager.default.fileExists(atPath: $0.path) }
             tracks.forEach(WAVRepair.fix)
-            let seconds = tracks.compactMap { WAVReader.readMonoPCM16($0) }.map { Double($0.count) / SampleSink.rate }.max() ?? 0
+            let seconds = tracks.compactMap(WAVReader.duration).max() ?? 0
             guard seconds >= 1 else { continue }
             let t = Transcript(id: m.id, createdAt: m.startedAt, title: m.title, sourcePath: folder.path, origin: m.origin,
-                               model: Engine.modelID, language: m.language, duration: seconds, processingSeconds: 0,
+                               model: Engine.modelID(for: m.language), language: m.language, duration: seconds, processingSeconds: 0,
                                text: "", segments: [], notes: m.notes.isEmpty ? nil : m.notes)
-            Store.shared.insert(t)
+            guard Store.shared.insert(t) else {
+                AppState.shared.lastError = "Couldn't recover \(m.title) into the library. Earshot will try again at the next launch."
+                continue
+            }
             AppState.shared.didSave(t)
             MeetingManifest.markSaved(folder)
             Notifier.post("Recovering \(m.title)", body: "Earshot stopped during this meeting. Transcribing what was recorded…")
@@ -177,7 +186,8 @@ enum WAVRepair {
     }
 }
 
-/// ⌃⌘B from any app: bookmark the running meeting.
+/// ⌃⌘B from any app: bookmark the running meeting. Registered only while a meeting records, so the shortcut
+/// belongs to other apps the rest of the time.
 @MainActor
 final class BookmarkHotkey {
     static let shared = BookmarkHotkey()
@@ -185,7 +195,7 @@ final class BookmarkHotkey {
     private var handler: EventHandlerRef?
 
     func update() {
-        Settings.bookmarkHotkey ? install() : uninstall()
+        Settings.bookmarkHotkey && MeetingController.shared.session != nil ? install() : uninstall()
     }
 
     private func install() {

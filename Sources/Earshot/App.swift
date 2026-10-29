@@ -11,7 +11,6 @@ struct EarshotApp: App {
             MainWindow()
                 .environment(state)
                 .background(WindowActions())
-                .sheet(isPresented: $state.showBatchExport) { BatchExportSheet(items: state.transcripts) }
                 .preferredColorScheme(state.colorScheme)
         }
         .windowBackgroundDragBehavior(.enabled)
@@ -26,7 +25,7 @@ struct EarshotApp: App {
         } label: {
             Image(systemName: state.meeting != nil ? "person.wave.2.fill"
                 : state.isRecording ? "record.circle.fill"
-                : state.activeJobs > 0 ? "waveform.badge.ellipsis" : "waveform")
+                : state.activeJobs > 0 ? "waveform.badge.magnifyingglass" : "waveform")
         }
         .menuBarExtraStyle(.window)
     }
@@ -54,6 +53,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             CalendarLookup.requestAccess()
             MeetingDetector.shared.start()
             FolderWatcher.shared.reload()
+        }
+    }
+
+    /// Quitting mid-meeting stops and saves the meeting first (at most ~15 s; anything left is recovered at the next launch).
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        MainActor.assumeIsolated {
+            let meetings = MeetingController.shared
+            guard meetings.session != nil || meetings.isStopping else { return .terminateNow }
+            Task { @MainActor in
+                await meetings.stopForQuit(timeout: 15)
+                sender.reply(toApplicationShouldTerminate: true)
+            }
+            return .terminateLater
         }
     }
 

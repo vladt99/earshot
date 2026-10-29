@@ -92,6 +92,7 @@ struct TranscriptRow: View {
 
 struct DeletedList: View {
     @Environment(AppState.self) private var state
+    @State private var confirmEmpty = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -99,7 +100,12 @@ struct DeletedList: View {
                 Text("Items are permanently deleted after 30 days.").foregroundStyle(.secondary)
                 Spacer()
                 if !state.deleted.isEmpty {
-                    Button("Empty Trash", role: .destructive) { state.emptyTrash() }.buttonStyle(.glass)
+                    Button("Empty Trash", role: .destructive) { confirmEmpty = true }.buttonStyle(.glass)
+                        .confirmationDialog("Delete \(state.deleted.count) transcripts permanently?", isPresented: $confirmEmpty) {
+                            Button("Empty Trash", role: .destructive) { state.emptyTrash() }
+                        } message: {
+                            Text("Their recordings are deleted too. This can't be undone.")
+                        }
                 }
             }
             .padding(.horizontal, 4)

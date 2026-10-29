@@ -7,7 +7,7 @@ final class EventBus: @unchecked Sendable {
     private let lock = NSLock()
     private var subscribers: [UUID: (filter: Set<String>?, continuation: AsyncStream<Data>.Continuation)] = [:]
 
-    /// `filter`: event-name prefixes to receive (e.g. ["meeting."]); nil = everything.
+    /// `filter`: event-name prefixes to receive (e.g. ["meeting."], "*" = all); nil = everything. Same rule as webhooks.
     func subscribe(filter: Set<String>?) -> AsyncStream<Data> {
         let id = UUID()
         let (stream, continuation) = AsyncStream<Data>.makeStream(bufferingPolicy: .bufferingNewest(500))
@@ -27,7 +27,7 @@ final class EventBus: @unchecked Sendable {
         guard let json = try? JSONSerialization.data(withJSONObject: body, options: [.withoutEscapingSlashes]) else { return }
         let frame = Data("event: \(event)\ndata: ".utf8) + json + Data("\n\n".utf8)
         let targets = lock.withLock { Array(subscribers.values) }
-        for t in targets where t.filter.map({ f in f.contains { event.hasPrefix($0) } }) ?? true {
+        for t in targets where t.filter.map({ Webhooks.matches(event, Array($0)) }) ?? true {
             t.continuation.yield(frame)
         }
         Webhooks.deliver(event, body)

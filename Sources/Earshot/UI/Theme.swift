@@ -7,42 +7,61 @@ import SwiftUI
 struct Backdrop: View {
     @Environment(AppState.self) private var state
     @Environment(\.colorScheme) private var scheme
+    private let model = BackdropModel.shared
 
     var body: some View {
         ZStack {
-            if let image = Self.image(version: state.backgroundVersion) {
+            if let image = model.image {
                 Image(nsImage: image).resizable().aspectRatio(contentMode: .fill)
             } else {
                 LinearGradient(colors: [.teal, .indigo, .purple], startPoint: .topLeading, endPoint: .bottomTrailing)
             }
-            Rectangle().fill(scheme == .dark ? Color.black.opacity(0.18 + Settings.backgroundDim) : Color.white.opacity(Settings.backgroundDim))
+            Rectangle().fill(scheme == .dark ? Color.black.opacity(0.18 + model.dim) : Color.white.opacity(model.dim))
         }
         .clipped()
         .ignoresSafeArea()
         .allowsHitTesting(false)
+        .task(id: state.backgroundVersion) { model.load(version: state.backgroundVersion) }
     }
+}
 
-    @MainActor private static var cache: (Int, NSImage?)?
+/// The decoded background (shared by every window) and the dim amount. `AppState.backgroundVersion` changes
+/// only when the picture does; dragging the Dim slider touches `dim` alone.
+@MainActor
+@Observable
+final class BackdropModel {
+    static let shared = BackdropModel()
 
-    @MainActor static func image(version: Int) -> NSImage? {
-        if let cache, cache.0 == version { return cache.1 }
+    private(set) var image: NSImage?
+    var dim = Settings.backgroundDim {
+        didSet { Settings.backgroundDim = dim }
+    }
+    @ObservationIgnored private var version: Int?
+    @ObservationIgnored private var loading: Task<Void, Never>?
+
+    /// Decodes off the main thread; the gradient shows until the first picture is ready.
+    func load(version: Int) {
+        guard self.version != version else { return }
+        self.version = version
         let url = Settings.backgroundImage.map(URL.init(fileURLWithPath:))
             ?? NSScreen.main.flatMap { NSWorkspace.shared.desktopImageURL(for: $0) }
-        let image = url.flatMap(thumbnail)
-        cache = (version, image)
-        return image
+        loading?.cancel()
+        loading = Task {
+            let cg = await Task.detached(priority: .utility) { url.flatMap(Self.thumbnail) }.value
+            guard !Task.isCancelled else { return }
+            image = cg.map { NSImage(cgImage: $0, size: .zero) }
+        }
     }
 
     /// Wallpapers are often 6K; one downscaled copy is plenty for a window.
-    private static func thumbnail(_ url: URL) -> NSImage? {
+    nonisolated private static func thumbnail(_ url: URL) -> CGImage? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceThumbnailMaxPixelSize: 2400,
             kCGImageSourceCreateThumbnailWithTransform: true,
         ]
-        guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
-        return NSImage(cgImage: cg, size: .zero)
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
     }
 }
 
@@ -171,18 +190,25 @@ struct PulseDot: View {
     let pulsing: Bool
     var size: CGFloat = 8
 
+    @State private var expanded = false
+
+    /// One repeating Core Animation-driven scale/fade instead of a per-frame redraw.
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1 / 30, paused: !pulsing)) { ctx in
-            let phase = pulsing ? (sin(ctx.date.timeIntervalSinceReferenceDate * 4) + 1) / 2 : 0
-            ZStack {
+        ZStack {
+            if pulsing {
                 Circle()
                     .fill(color.opacity(0.35))
-                    .frame(width: size * (1 + phase), height: size * (1 + phase))
-                    .opacity(pulsing ? 1 - phase * 0.7 : 0)
-                Circle().fill(color).frame(width: size, height: size)
+                    .frame(width: size, height: size)
+                    .scaleEffect(expanded ? 2 : 1)
+                    .opacity(expanded ? 0.3 : 1)
+                    .animation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true), value: expanded)
+                    .onAppear { expanded = true }
+                    .onDisappear { expanded = false }
             }
+            Circle().fill(color).frame(width: size, height: size)
         }
         .frame(width: size * 2, height: size * 2)
+        .accessibilityHidden(true)
     }
 }
 

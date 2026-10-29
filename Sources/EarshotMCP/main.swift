@@ -6,7 +6,8 @@ import Foundation
 //
 //   claude mcp add earshot -- /Applications/Earshot.app/Contents/MacOS/earshot-mcp
 
-let protocolVersion = "2025-06-18"
+let supportedVersions = ["2025-06-18", "2025-03-26", "2024-11-05"]
+let serverVersion = "0.9.0"
 
 struct Tool {
     let name: String
@@ -33,9 +34,12 @@ func apiInfo() throws -> (URL, String) {
 
 func request(_ method: String, _ path: String, query: [String: String] = [:], body: [String: Any]? = nil) async throws -> Any {
     let (base, token) = try apiInfo()
-    var parts = URLComponents(url: base.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
+    // `path` is already percent-encoded (see `segment`).
+    guard var parts = URLComponents(url: base, resolvingAgainstBaseURL: false) else { throw Failure.message("Bad base_url in api.json") }
+    parts.percentEncodedPath = (parts.percentEncodedPath.hasSuffix("/") ? String(parts.percentEncodedPath.dropLast()) : parts.percentEncodedPath) + "/" + path
     if !query.isEmpty { parts.queryItems = query.map { URLQueryItem(name: $0.key, value: $0.value) } }
-    var req = URLRequest(url: parts.url!, timeoutInterval: 600)
+    guard let url = parts.url else { throw Failure.message("Bad request path") }
+    var req = URLRequest(url: url, timeoutInterval: 600)
     req.httpMethod = method
     req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
     if let body {
@@ -64,6 +68,11 @@ func string(_ args: [String: Any], _ key: String) -> String? {
     (args[key] as? String).flatMap { $0.isEmpty ? nil : $0 }
 }
 
+/// One URL path segment ("/", "?", "#", "%" escaped).
+func segment(_ s: String) -> String {
+    s.addingPercentEncoding(withAllowedCharacters: CharacterSet.urlPathAllowed.subtracting(CharacterSet(charactersIn: "/?#%;"))) ?? ""
+}
+
 // MARK: - Tools
 
 let tools: [Tool] = [
@@ -88,7 +97,7 @@ let tools: [Tool] = [
          properties: ["id": ["type": "string"], "format": ["type": "string", "enum": ["text", "json"]]],
          required: ["id"]) { a in
         let format = string(a, "format") == "json" ? "verbose_json" : "text"
-        return pretty(try await request("GET", "v1/transcripts/\(string(a, "id") ?? "")", query: ["format": format]))
+        return pretty(try await request("GET", "v1/transcripts/" + segment(string(a, "id") ?? ""), query: ["format": format]))
     },
     Tool(name: "current_meeting",
          description: "The meeting being recorded right now: live transcript so far, notes, warnings. Says so when nothing is recording.",
@@ -131,24 +140,44 @@ let tools: [Tool] = [
 
 // MARK: - JSON-RPC loop
 
+let outputLock = NSLock()
+
+/// One write per message, newline-delimited; requests run concurrently, so writes are serialised.
 func send(_ message: [String: Any]) {
     guard var data = try? JSONSerialization.data(withJSONObject: message, options: [.withoutEscapingSlashes]) else { return }
     data.append(0x0A)
-    FileHandle.standardOutput.write(data)
+    outputLock.withLock { FileHandle.standardOutput.write(data) }
 }
 
-func handle(_ msg: [String: Any]) async {
-    let id = msg["id"]
-    let method = msg["method"] as? String ?? ""
+func fail(_ id: Any, _ code: Int, _ message: String) {
+    send(["jsonrpc": "2.0", "id": id, "error": ["code": code, "message": message]])
+}
+
+func dispatch(_ line: String) async {
+    guard let value = try? JSONSerialization.jsonObject(with: Data(line.utf8), options: [.fragmentsAllowed]) else {
+        fail(NSNull(), -32700, "Parse error"); return
+    }
+    guard let msg = value as? [String: Any] else { fail(NSNull(), -32600, "Invalid Request"); return }
+    guard let methodValue = msg["method"] else {
+        // A response to something we sent (we send nothing, but never answer one).
+        if msg["id"] == nil { fail(NSNull(), -32600, "Invalid Request") }
+        return
+    }
+    guard let method = methodValue as? String else { fail(msg["id"] ?? NSNull(), -32600, "Invalid Request"); return }
+    await handle(msg, method: method)
+}
+
+func handle(_ msg: [String: Any], method: String) async {
     let params = msg["params"] as? [String: Any] ?? [:]
-    guard let id else { return } // notifications (initialized, cancelled) need no reply
+    guard let id = msg["id"] else { return } // notifications (initialized, cancelled) need no reply
 
     switch method {
     case "initialize":
+        let asked = params["protocolVersion"] as? String
         send(["jsonrpc": "2.0", "id": id, "result": [
-            "protocolVersion": (params["protocolVersion"] as? String) ?? protocolVersion,
+            "protocolVersion": asked.flatMap { supportedVersions.contains($0) ? $0 : nil } ?? supportedVersions[0],
             "capabilities": ["tools": [:]],
-            "serverInfo": ["name": "earshot", "version": "0.8.0"],
+            "serverInfo": ["name": "earshot", "version": serverVersion],
             "instructions": "Meeting transcripts recorded on this Mac by Earshot. Search first, then read a transcript by id.",
         ]])
     case "ping":
@@ -164,20 +193,32 @@ func handle(_ msg: [String: Any]) async {
             send(["jsonrpc": "2.0", "id": id, "error": ["code": -32602, "message": "Unknown tool \(name)"]])
             return
         }
+        let args = params["arguments"] as? [String: Any] ?? [:]
         do {
-            let text = try await tool.call(params["arguments"] as? [String: Any] ?? [:])
+            let missing = tool.required.filter { key in
+                guard let v = args[key], !(v is NSNull) else { return true }
+                return (v as? String)?.isEmpty == true
+            }
+            guard missing.isEmpty else { throw Failure.message("Missing required argument: \(missing.joined(separator: ", "))") }
+            let text = try await tool.call(args)
             send(["jsonrpc": "2.0", "id": id, "result": ["content": [["type": "text", "text": text]]]])
         } catch {
             let text = (error as? Failure).map { if case .message(let m) = $0 { m } else { "" } } ?? error.localizedDescription
             send(["jsonrpc": "2.0", "id": id, "result": ["content": [["type": "text", "text": text]], "isError": true]])
         }
     default:
-        send(["jsonrpc": "2.0", "id": id, "error": ["code": -32601, "message": "Method not found: \(method)"]])
+        fail(id, -32601, "Method not found: \(method)")
     }
 }
 
+// Each message is handled on its own task, so a long transcribe_file never blocks ping or anything else.
+let inFlight = DispatchGroup()
 while let line = readLine(strippingNewline: true) {
-    guard !line.isEmpty, let data = line.data(using: .utf8),
-          let msg = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
-    await handle(msg)
+    guard !line.trimmingCharacters(in: .whitespaces).isEmpty else { continue }
+    inFlight.enter()
+    Task.detached {
+        await dispatch(line)
+        inFlight.leave()
+    }
 }
+inFlight.wait()

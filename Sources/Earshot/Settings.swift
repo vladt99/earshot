@@ -215,6 +215,9 @@ enum Settings {
         get { d.object(forKey: "copyDictationToClipboard") as? Bool ?? true }
         set { d.set(newValue, forKey: "copyDictationToClipboard") }
     }
+
+    /// CFBundleShortVersionString; "dev" for a bare `swift run`.
+    static let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
 }
 
 struct APIError: Error {
@@ -226,4 +229,4 @@ struct APIError: Error {
     }
 }
 
-let appVersion = "0.8.0"
+var appVersion: String { Settings.appVersion }

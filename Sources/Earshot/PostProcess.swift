@@ -6,17 +6,26 @@ enum PostProcess {
     static func apply(_ t: Transcript) -> Transcript {
         var t = t
         let ignored = Set(Settings.ignoredSegments.map { $0.lowercased().trimmingCharacters(in: .whitespaces) })
-        let pairs = Settings.findReplace.filter { $0.count == 2 && !$0[0].isEmpty }
-        guard !ignored.isEmpty || !pairs.isEmpty else { return t }
+        let rules = Settings.findReplace.filter { $0.count == 2 && !$0[0].isEmpty }.compactMap(replacement)
+        guard !ignored.isEmpty || !rules.isEmpty else { return t }
         t.segments = t.segments
             .filter { !ignored.contains($0.text.lowercased().trimmingCharacters(in: .whitespaces)) }
             .map { s in
                 var s = s
-                for p in pairs { s.text = s.text.replacingOccurrences(of: p[0], with: p[1], options: .caseInsensitive) }
+                for (regex, template) in rules {
+                    s.text = regex.stringByReplacingMatches(in: s.text, range: NSRange(s.text.startIndex..., in: s.text), withTemplate: template)
+                }
                 return s
             }
         t.text = Formats.speakerText(t.segments)
         return t
+    }
+
+    /// Whole words only ("AI" leaves "said" alone), case-insensitive, both sides taken literally.
+    private static func replacement(_ pair: [String]) -> (NSRegularExpression, String)? {
+        let pattern = #"(?<![\p{L}\p{N}_])"# + NSRegularExpression.escapedPattern(for: pair[0]) + #"(?![\p{L}\p{N}_])"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
+        return (regex, NSRegularExpression.escapedTemplate(for: pair[1]))
     }
 
     static func finished(_ t: Transcript) {
@@ -31,26 +40,57 @@ enum PostProcess {
         return f
     }()
 
-    /// Batch Export / Auto-Export: one file per transcript and format.
+    static func fileExtension(_ format: String) -> String { format == "text" ? "txt" : format }
+
+    /// The file contents for one export format.
+    static func render(_ t: Transcript, format: String) -> Data {
+        switch format {
+        case "srt": return Data(Formats.srt(t).utf8)
+        case "vtt": return Data(Formats.vtt(t).utf8)
+        case "md": return Data(Formats.markdown(t).utf8)
+        case "json": return (try? JSONSerialization.data(withJSONObject: Formats.verbose(t), options: [.prettyPrinted, .sortedKeys])) ?? Data()
+        default: return Data(Formats.speakerText(t.segments).utf8)
+        }
+    }
+
+    /// A title that is safe as a file name: no path separators or control characters, at most 120 characters and
+    /// well under the 255-byte name limit.
+    static func safeName(_ title: String) -> String {
+        var name = String(title.map { $0 == "/" || $0 == ":" ? "-" : $0.isNewline || ($0.unicodeScalars.first?.properties.generalCategory == .control) ? " " : $0 })
+            .trimmingCharacters(in: .whitespaces)
+        if name.count > 120 { name = String(name.prefix(120)).trimmingCharacters(in: .whitespaces) }
+        while name.utf8.count > 200 { name.removeLast() }
+        if name.hasPrefix(".") { name = "-" + name.dropFirst() }
+        return name.isEmpty ? "Untitled" : name
+    }
+
+    /// Batch Export / Auto-Export: one file per transcript and format. Failures are reported in AppState.lastError.
     @discardableResult
     static func export(_ items: [Transcript], to folder: URL, formats: [String]) -> Int {
         var written = 0
+        var failed: [String] = []
+        let fm = FileManager.default
         for t in items {
-            // "2026-10-28 14.30 Weekly sync" sorts by date in a notes folder and never collides across meetings.
-            let base = "\(stamp.string(from: t.createdAt)) \(t.title)".replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: ".")
+            // "2026-10-28 14.30 Weekly sync" sorts by date in a notes folder; a different transcript with the same
+            // name in the same minute gets its id appended instead of overwriting.
+            let base = "\(stamp.string(from: t.createdAt).replacingOccurrences(of: ":", with: ".")) \(safeName(t.title))"
             for f in formats {
-                let body: String
-                switch f {
-                case "srt": body = Formats.srt(t)
-                case "vtt": body = Formats.vtt(t)
-                case "md": body = Formats.markdown(t)
-                case "json":
-                    body = String(data: (try? JSONSerialization.data(withJSONObject: Formats.verbose(t), options: [.prettyPrinted, .sortedKeys])) ?? Data(), encoding: .utf8) ?? ""
-                default: body = Formats.speakerText(t.segments)
+                let body = render(t, format: f)
+                var url = folder.appendingPathComponent("\(base).\(fileExtension(f))")
+                if fm.fileExists(atPath: url.path), (try? Data(contentsOf: url)) != body {
+                    url = folder.appendingPathComponent("\(base) \(t.id.prefix(6)).\(fileExtension(f))")
                 }
-                let url = folder.appendingPathComponent("\(base).\(f == "txt" ? "txt" : f)")
-                if (try? body.write(to: url, atomically: true, encoding: .utf8)) != nil { written += 1 }
+                do {
+                    try body.write(to: url, options: .atomic)
+                    written += 1
+                } catch {
+                    failed.append("\(url.lastPathComponent): \(error.localizedDescription)")
+                }
             }
+        }
+        if !failed.isEmpty {
+            let message = "Export failed for \(failed.count) file\(failed.count == 1 ? "" : "s") — \(failed[0])"
+            Task { @MainActor in AppState.shared.lastError = message }
         }
         return written
     }

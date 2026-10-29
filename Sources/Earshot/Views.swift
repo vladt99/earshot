@@ -34,7 +34,8 @@ struct MenuPanel: View {
             .controlSize(.large)
 
             HStack {
-                Label(state.speechReady ? "Parakeet v3" : "No model", systemImage: "waveform.badge.mic")
+                Label(state.downloads[state.speechModel.id].map { "Downloading \(Int($0 * 100))%" }
+                      ?? (state.speechModelReady ? state.speechModelShortName : "No model"), systemImage: "waveform.badge.mic")
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 LanguageMenu().fixedSize()
@@ -71,6 +72,7 @@ struct MenuPanel: View {
 
 struct MeetingMenuSection: View {
     @Environment(AppState.self) private var state
+    @AppStorage("meetingMode") private var meetingMode = "ask"
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -84,7 +86,11 @@ struct MeetingMenuSection: View {
                 HStack {
                     Button("Show Live") { MeetingPanel.shared.show() }.buttonStyle(.glass)
                     Spacer()
-                    Button("Stop") { state.stopMeeting() }.buttonStyle(.glassProminent).tint(.red)
+                    if m.stopping {
+                        Text("Saving…").font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Button("Stop") { state.stopMeeting() }.buttonStyle(.glassProminent).tint(.red)
+                    }
                 }
             } else if let d = state.detectedMeeting {
                 Label("Meeting detected in \(d.appName)", systemImage: "phone.bubble").font(.callout).lineLimit(1)
@@ -94,13 +100,15 @@ struct MeetingMenuSection: View {
                 }
             } else {
                 Text("Meetings").font(.callout.bold())
-                Text(Settings.meetingMode == "auto" ? "Calls are recorded automatically." :
-                        Settings.meetingMode == "off" ? "Meeting detection is off." : "You'll be asked when a call starts.")
+                Text(meetingMode == "auto" ? "Calls are recorded automatically." :
+                        meetingMode == "off" ? "Meeting detection is off." : "You'll be asked when a call starts.")
                     .font(.caption).foregroundStyle(.secondary)
                 HStack {
                     Button("Start Now") { state.startMeeting() }.buttonStyle(.glass)
                     Button("Live Captions") { state.toggleLiveCaptions() }.buttonStyle(.glass)
                 }
+                .disabled(state.recordingKind != nil)
+                .help(state.recordingKind != nil ? "Stop the \(state.recordingKind == "voicememo" ? "voice memo" : "dictation") first" : "")
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)

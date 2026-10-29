@@ -25,7 +25,7 @@ struct HomeView: View {
             if recent.isEmpty {
                 EmptyStateView(symbol: "waveform.badge.plus", title: "No Transcripts",
                                message: "Join a call, drop a file here, or start a voice memo.",
-                               action: ("Start Voice Memo", { state.toggleVoiceMemo() }))
+                               action: state.recordingKind == nil && state.meeting == nil ? ("Start Voice Memo", { state.toggleVoiceMemo() }) : nil)
                     .card()
             } else {
                 TranscriptGroups(items: Array(recent.prefix(40)))
@@ -52,6 +52,7 @@ struct HomeView: View {
 /// The live meeting or recording, or what Earshot is waiting for.
 private struct NowCard: View {
     @Environment(AppState.self) private var state
+    @AppStorage("meetingMode") private var meetingMode = "ask"
 
     var body: some View {
         Group {
@@ -75,8 +76,12 @@ private struct NowCard: View {
                     GlassEffectContainer {
                         HStack(spacing: 6) {
                             Button("Live Transcript") { MeetingPanel.shared.show() }
-                            Button("Bookmark") { MeetingController.shared.addNote(nil, kind: "bookmark") }
-                            Button("Stop") { state.stopMeeting() }.tint(.red)
+                            if m.stopping {
+                                Button("Saving…") {}.disabled(true)
+                            } else {
+                                Button("Bookmark") { MeetingController.shared.addNote(nil, kind: "bookmark") }
+                                Button("Stop") { state.stopMeeting() }.tint(.red)
+                            }
                         }
                         .buttonStyle(.glass)
                         .controlSize(.small)
@@ -98,11 +103,11 @@ private struct NowCard: View {
                 .card(tint: .red)
             } else {
                 HStack(spacing: 10) {
-                    PulseDot(color: Settings.meetingMode == "off" ? .gray : .green, pulsing: false)
+                    PulseDot(color: meetingMode == "off" ? .gray : .green, pulsing: false)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(Settings.meetingMode == "off" ? "Meeting alerts are off" : "Waiting for a call")
+                        Text(meetingMode == "off" ? "Meeting alerts are off" : meetingMode == "auto" ? "Waiting for a call to record" : "Waiting for a call")
                             .font(.headline)
-                        Text(Settings.meetingMode == "off"
+                        Text(meetingMode == "off"
                              ? "Start a recording from the toolbar, or turn alerts on in Settings → Record Meetings."
                              : "Earshot notices when Meet, Zoom, Teams, Webex, Slack or FaceTime start using the microphone.")
                             .font(.callout).foregroundStyle(.secondary)
@@ -191,6 +196,10 @@ private struct QuickStart: View {
     @State private var url = ""
 
     var body: some View {
+        // One recording at a time: starting another would silently reuse (or stop) the running one.
+        let busyReason: String? = state.meeting != nil ? "A meeting is being recorded" :
+            state.recordingKind == "dictation" ? "Dictation is running" :
+            state.recordingKind == "voicememo" ? "A voice memo is recording" : nil
         VStack(alignment: .leading, spacing: 10) {
             GlassEffectContainer(spacing: 8) {
                 HStack(spacing: 8) {
@@ -199,6 +208,8 @@ private struct QuickStart: View {
                         Button { state.startMeeting(app: id) } label: {
                             Label(id == "com.google.Chrome" ? "Google Meet" : name, systemImage: "video")
                         }
+                        .disabled(busyReason != nil)
+                        .help(busyReason.map { "\($0); stop it first" } ?? "Record a meeting in \(name)")
                         .contextMenu {
                             Button("Remove Shortcut", role: .destructive) { state.homeShortcuts.removeAll { $0 == id } }
                         }
@@ -207,8 +218,13 @@ private struct QuickStart: View {
                         Label(state.recordingKind == "voicememo" ? "Stop Memo" : "Voice Memo",
                               systemImage: state.recordingKind == "voicememo" ? "stop.circle.fill" : "mic")
                     }
+                    .disabled(busyReason != nil && state.recordingKind != "voicememo")
+                    .help(state.recordingKind == "voicememo" ? "Stop and transcribe the voice memo"
+                          : busyReason.map { "\($0); stop it first" } ?? "Record a voice memo")
                     Button { state.showImporter = true } label: { Label("Open Files", systemImage: "folder.badge.plus") }
                     Button { state.showAppAudioPicker = true } label: { Label("App Audio", systemImage: "app.badge") }
+                        .disabled(busyReason != nil)
+                        .help(busyReason.map { "\($0); stop it first" } ?? "Record what an app plays")
                     Menu {
                         ForEach(MeetingApp.known.filter { !state.homeShortcuts.contains($0.bundleID) }, id: \.bundleID) { app in
                             Button(app.name) { state.homeShortcuts.append(app.bundleID) }
@@ -278,15 +294,20 @@ struct AppAudioPicker: View {
         let apps = NSWorkspace.shared.runningApplications
             .filter { $0.activationPolicy == .regular && $0.bundleIdentifier != Bundle.main.bundleIdentifier }
             .sorted { ($0.localizedName ?? "") < ($1.localizedName ?? "") }
+        let busy = state.meeting != nil || state.recordingKind != nil
         VStack(alignment: .leading, spacing: 12) {
             Text("Record App Audio").font(.title2.bold())
             Text("Records and transcribes everything the app plays. Your microphone is not recorded.").foregroundStyle(.secondary)
+            if busy {
+                Label("Another recording is running. Stop it first.", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+            }
             ScrollView {
                 VStack(spacing: 6) {
                     Button { state.startAppAudio(nil, name: "System Audio"); dismiss() } label: {
                         Label("All System Audio", systemImage: "speaker.wave.3").frame(maxWidth: .infinity, alignment: .leading).padding(10)
                     }
-                    .buttonStyle(.plain).card(padding: 0, interactive: true)
+                    .buttonStyle(.plain).card(padding: 0, interactive: true).disabled(busy)
                     ForEach(apps, id: \.processIdentifier) { app in
                         Button { state.startAppAudio(app.bundleIdentifier, name: app.localizedName ?? "App"); dismiss() } label: {
                             HStack {
@@ -296,11 +317,11 @@ struct AppAudioPicker: View {
                             }
                             .padding(8)
                         }
-                        .buttonStyle(.plain).card(padding: 0, interactive: true)
+                        .buttonStyle(.plain).card(padding: 0, interactive: true).disabled(busy)
                     }
                 }
             }
-            HStack { Spacer(); Button("Cancel") { dismiss() }.buttonStyle(.glass) }
+            HStack { Spacer(); Button("Cancel") { dismiss() }.buttonStyle(.glass).keyboardShortcut(.cancelAction) }
         }
         .padding(22).frame(width: 420, height: 520)
     }
@@ -326,7 +347,7 @@ struct BatchExportSheet: View {
             if let result { Text(result).foregroundStyle(.green) }
             HStack {
                 Spacer()
-                Button("Cancel") { dismiss() }.buttonStyle(.glass)
+                Button(result == nil ? "Cancel" : "Done") { dismiss() }.buttonStyle(.glass).keyboardShortcut(.cancelAction)
                 Button("Choose Folder & Export") {
                     let panel = NSOpenPanel()
                     panel.canChooseDirectories = true

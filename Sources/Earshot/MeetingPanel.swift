@@ -31,7 +31,9 @@ final class MeetingPanel {
             p.titleVisibility = .hidden
             p.isOpaque = false
             p.backgroundColor = .clear
-            p.isMovableByWindowBackground = true
+            // Only the header drags the panel, so selecting transcript text doesn't move it.
+            p.isMovableByWindowBackground = false
+            p.isReleasedWhenClosed = false
             p.level = .floating
             p.isFloatingPanel = true
             p.hidesOnDeactivate = false
@@ -64,7 +66,13 @@ final class MeetingPanel {
         panel?.orderFrontRegardless()
     }
 
-    func hide() { panel?.orderOut(nil) }
+    var isVisible: Bool { panel?.isVisible ?? false }
+
+    /// Safe to call any number of times, in any state.
+    func hide() {
+        guard let panel, panel.isVisible else { return }
+        panel.orderOut(nil)
+    }
 }
 
 struct LiveMeetingView: View {
@@ -91,8 +99,17 @@ struct LiveMeetingView: View {
                         .font(.caption).padding(8).frame(maxWidth: .infinity, alignment: .leading)
                         .background(.yellow.opacity(0.15), in: RoundedRectangle(cornerRadius: 6))
                 }
+                if m.captionsNeedAccess {
+                    HStack {
+                        Label("Speaker names need Accessibility access", systemImage: "captions.bubble").font(.caption)
+                        Spacer()
+                        Button("Settings…") { state.openSettings("Note Taker") }.controlSize(.small)
+                    }
+                    .padding(8)
+                    .background(.yellow.opacity(0.15), in: RoundedRectangle(cornerRadius: 6))
+                }
                 transcript(m)
-                NoteBar()
+                if !m.stopping { NoteBar() }
             } else if let d = state.detectedMeeting {
                 VStack(alignment: .leading, spacing: 10) {
                     Label("Meeting detected in \(d.appName)", systemImage: "phone.bubble").font(.headline)
@@ -141,14 +158,20 @@ struct LiveMeetingView: View {
             GlassEffectContainer {
                 HStack(spacing: 6) {
                     Button("Copy") { state.copy(Formats.speakerText(m.lines)) }.buttonStyle(.glass)
-                    Button("Stop") { state.stopMeeting() }.buttonStyle(.glassProminent).tint(.red)
+                    if m.stopping {
+                        Label("Saving…", systemImage: "hourglass").font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Button("Stop") { state.stopMeeting() }.buttonStyle(.glassProminent).tint(.red)
+                    }
                     Button { MeetingPanel.shared.hide() } label: { Image(systemName: "xmark") }
                         .buttonStyle(.glass)
-                        .help("Hide (keeps recording)")
+                        .help(m.stopping ? "Close" : "Hide (keeps recording)")
+                        .accessibilityLabel(m.stopping ? "Close" : "Hide live transcript")
                 }
                 .controlSize(.small)
             }
         }
+        .background(WindowDragArea())
     }
 
     private func transcript(_ m: MeetingSnapshot) -> some View {
@@ -184,13 +207,27 @@ private struct NoteBar: View {
                 .textFieldStyle(.plain).padding(.horizontal, 10).padding(.vertical, 6)
                 .glassEffect(.regular, in: Capsule())
                 .onSubmit {
-                    MeetingController.shared.addNote(text)
+                    let note = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !note.isEmpty else { return }
+                    MeetingController.shared.addNote(note)
                     text = ""
                 }
             Button { MeetingController.shared.addNote(nil, kind: "bookmark") } label: { Image(systemName: "bookmark.fill") }
                 .buttonStyle(.glass).help("Bookmark this moment (⌃⌘B)")
+                .accessibilityLabel("Bookmark this moment")
         }
     }
+}
+
+/// Drags the window from the area behind it (the panel's header).
+private struct WindowDragArea: NSViewRepresentable {
+    final class DragView: NSView {
+        override var mouseDownCanMoveWindow: Bool { true }
+        override func mouseDown(with event: NSEvent) { window?.performDrag(with: event) }
+    }
+
+    func makeNSView(context: Context) -> NSView { DragView() }
+    func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
 private struct NoteLine: View {

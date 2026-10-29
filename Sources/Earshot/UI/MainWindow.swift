@@ -61,6 +61,7 @@ struct MainWindow: View {
 
 private struct Page: View {
     @Environment(AppState.self) private var state
+    @AppStorage("meetingMode") private var meetingMode = "ask"
 
     var body: some View {
         switch state.route {
@@ -92,7 +93,7 @@ private struct Page: View {
         case .meetings:
             LibraryList(items: state.transcripts.filter { $0.origin == "meeting" },
                         empty: ("person.2.wave.2", "No Meetings Yet", "Earshot notices when a call starts in Meet, Zoom, Teams and others.",
-                                ("Enable Meeting Alerts", { Settings.meetingMode = "ask"; state.toast("Meeting alerts enabled") })))
+                                meetingMode == "off" ? ("Enable Meeting Alerts", { meetingMode = "ask"; state.toast("Meeting alerts enabled") }) : nil))
         case .dictations:
             LibraryList(items: state.transcripts.filter { $0.origin == "dictation" },
                         empty: ("character.cursor.ibeam", "No Dictations Yet", "Text you dictate will appear here.",
@@ -121,12 +122,18 @@ private struct MainToolbar: ToolbarContent {
             }
         }
         ToolbarItemGroup(placement: .primaryAction) {
-            if state.meeting != nil {
+            if let m = state.meeting {
                 Button { MeetingPanel.shared.show() } label: { Label("Live Transcript", systemImage: "text.bubble") }
                     .help("Show the live transcript")
-                Button(role: .destructive) { state.stopMeeting() } label: { Label("Stop", systemImage: "stop.fill") }
-                    .tint(.red)
-                    .help("Stop and save the meeting")
+                if m.stopping {
+                    Button {} label: { Label("Saving…", systemImage: "hourglass") }
+                        .disabled(true)
+                        .help("Saving the meeting")
+                } else {
+                    Button(role: .destructive) { state.stopMeeting() } label: { Label("Stop", systemImage: "stop.fill") }
+                        .tint(.red)
+                        .help("Stop and save the meeting")
+                }
             } else {
                 RecordMenu()
             }
@@ -145,17 +152,25 @@ private struct RecordMenu: View {
     @Environment(AppState.self) private var state
 
     var body: some View {
+        // Only one recording at a time: starting another would silently reuse (or stop) the running one.
+        let dictating = state.recordingKind == "dictation"
+        let busy = state.recordingKind != nil || state.meeting != nil
         Menu {
             Section("Meeting") {
                 ForEach(MeetingApp.known.filter { !$0.isBrowser || $0.bundleID == "com.google.Chrome" }, id: \.bundleID) { app in
                     Button(app.bundleID == "com.google.Chrome" ? "Google Meet (Chrome)" : app.name) { state.startMeeting(app: app.bundleID) }
+                        .disabled(busy)
                 }
             }
             Section {
-                Button("Voice Memo", systemImage: "mic") { state.toggleVoiceMemo() }
-                Button("App Audio…", systemImage: "app.badge") { state.showAppAudioPicker = true }
-                Button("Podcast (Mic + System)", systemImage: "person.2.wave.2") { state.startPodcast() }
-                Button("Live Captions", systemImage: "captions.bubble") { state.toggleLiveCaptions() }
+                Button(state.recordingKind == "voicememo" ? "Stop Voice Memo" : "Voice Memo", systemImage: "mic") { state.toggleVoiceMemo() }
+                    .disabled(dictating || state.meeting != nil)
+                Button("App Audio…", systemImage: "app.badge") { state.showAppAudioPicker = true }.disabled(busy)
+                Button("Podcast (Mic + System)", systemImage: "person.2.wave.2") { state.startPodcast() }.disabled(busy)
+                Button("Live Captions", systemImage: "captions.bubble") { state.toggleLiveCaptions() }.disabled(busy)
+            }
+            if busy {
+                Section { Text(dictating ? "Dictation is running" : "A recording is running") }
             }
         } label: {
             Label("Record", systemImage: state.recordingKind == nil ? "record.circle" : "stop.circle.fill")
@@ -168,14 +183,17 @@ private struct ModelMenu: View {
     @Environment(AppState.self) private var state
 
     var body: some View {
+        let model = state.speechModel
         Menu {
-            Label("Parakeet TDT v3 · FluidAudio", systemImage: "checkmark")
-            Text(ModelCatalog.parakeet.purpose)
+            ForEach([ModelCatalog.parakeet, ModelCatalog.whisper]) { m in
+                if m.id == model.id { Label(m.name, systemImage: "checkmark") } else { Text(m.name) }
+            }
+            Text("English and Auto Detect use Parakeet, other languages Whisper")
             Divider()
             Button("Manage Models…") { state.openSettings("Local Models") }
         } label: {
-            Label(state.downloads[ModelCatalog.parakeet.id].map { "Downloading \(Int($0 * 100))%" }
-                  ?? (state.speechReady ? "Parakeet v3" : "No model"), systemImage: "waveform.badge.mic")
+            Label(state.downloads[model.id].map { "Downloading \(Int($0 * 100))%" }
+                  ?? (state.speechModelReady ? state.speechModelShortName : "No model"), systemImage: "waveform.badge.mic")
                 .labelStyle(.titleAndIcon)
         }
         .help("Speech model")
@@ -187,6 +205,7 @@ struct LanguageMenu: View {
     static let languages: [(String, String)] = [("auto", "Auto Detect"), ("en", "English"), ("nl", "Dutch"), ("fr", "French"),
                                                 ("de", "German"), ("it", "Italian"), ("pl", "Polish"), ("pt", "Portuguese"),
                                                 ("ro", "Romanian"), ("es", "Spanish"), ("sv", "Swedish"), ("uk", "Ukrainian")]
+    static let whisperNote = "Languages other than English use Whisper (\(ModelCatalog.whisper.sizeText) download)"
 
     var body: some View {
         Menu {
@@ -195,6 +214,9 @@ struct LanguageMenu: View {
                     if state.language == code { Label(name, systemImage: "checkmark") } else { Text(name) }
                 }
             }
+            Divider()
+            Text(Self.whisperNote)
+            if let p = state.downloads[ModelCatalog.whisper.id] { Text("Downloading Whisper… \(Int(p * 100))%") }
         } label: {
             Label(Self.languages.first { $0.0 == state.language }?.1 ?? state.language, systemImage: "globe")
                 .labelStyle(.titleAndIcon)
@@ -237,6 +259,7 @@ private struct Sidebar: View {
                     Button { newFolder = true } label: { Image(systemName: "plus") }
                         .buttonStyle(.borderless).padding(.trailing, 10).padding(.top, 10)
                         .help("New folder")
+                        .accessibilityLabel("New folder")
                 }
                 ForEach(state.folders) { f in
                     row(f.name, "folder", .folder(f.id))
@@ -296,14 +319,10 @@ private struct SidebarRow: View {
                 Spacer(minLength: 4)
                 if live { PulseDot(color: .red, pulsing: true, size: 6) }
                 if badge > 0 { Text("\(badge)").font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
-                if let onClose, hover || selected {
-                    Button(action: onClose) { Image(systemName: "xmark").font(.caption2) }
-                        .buttonStyle(.borderless)
-                        .help("Close")
-                }
             }
             .fontWeight(selected ? .semibold : .regular)
-            .padding(.horizontal, 10)
+            .padding(.leading, 10)
+            .padding(.trailing, onClose == nil ? 10 : 28)
             .padding(.vertical, 7)
             .contentShape(.rect)
             .background {
@@ -317,6 +336,16 @@ private struct SidebarRow: View {
             }
         }
         .buttonStyle(.plain)
+        // A sibling of the row button, not inside its label, so the click can't reach the row's action.
+        .overlay(alignment: .trailing) {
+            if let onClose, hover || selected {
+                Button(action: onClose) { Image(systemName: "xmark").font(.caption2) }
+                    .buttonStyle(.borderless)
+                    .padding(.trailing, 10)
+                    .help("Close")
+                    .accessibilityLabel("Close \(title)")
+            }
+        }
         .onHover { hover = $0 }
         .animation(.easeOut(duration: 0.12), value: hover)
     }
@@ -342,11 +371,11 @@ private struct SidebarStatus: View {
                 }
                 .buttonStyle(.plain)
             }
-            if let p = state.downloads[ModelCatalog.parakeet.id] {
+            if let p = state.downloads[state.speechModel.id] {
                 status("Speech model", "\(Int(p * 100))%")
                 LevelBar(value: p, height: 4)
             } else {
-                status("Speech model", state.speechReady ? "Ready" : "Not downloaded", color: state.speechReady ? .green : .orange)
+                status("Speech model", state.speechModelReady ? "Ready" : "Not downloaded", color: state.speechModelReady ? .green : .orange)
             }
             status("Local API", state.serverRunning ? ":\(Settings.port)" : "Off", color: state.serverRunning ? .green : .red)
             Divider()
@@ -355,6 +384,7 @@ private struct SidebarStatus: View {
                 Spacer()
                 Button { state.openSupport() } label: { Image(systemName: "questionmark.circle") }
                     .help("Help")
+                    .accessibilityLabel("Help")
             }
             .buttonStyle(.borderless)
             .font(.callout)
