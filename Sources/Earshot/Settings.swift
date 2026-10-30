@@ -56,6 +56,13 @@ enum Settings {
         set { d.set(newValue, forKey: "autoStopAfterMeeting") }
     }
 
+    /// "Show options before joining a Meet call": the panel opens on Meet's pre-join screen to pick the language and
+    /// what to record.
+    static var preJoinOverlay: Bool {
+        get { d.object(forKey: "preJoinOverlay") as? Bool ?? true }
+        set { d.set(newValue, forKey: "preJoinOverlay") }
+    }
+
     /// "Automatically dismiss detected meeting alerts after 10 seconds"
     static var autoDismissMeetingAlerts: Bool {
         get { d.object(forKey: "autoDismissMeetingAlerts") as? Bool ?? true }
@@ -97,6 +104,42 @@ enum Settings {
     }
 
     // MARK: Note taker
+
+    /// Switch on the meeting app's captions (they show only on your screen) so speakers can be named.
+    static var autoEnableCaptions: Bool {
+        get { d.object(forKey: "autoEnableCaptions") as? Bool ?? true }
+        set { d.set(newValue, forKey: "autoEnableCaptions") }
+    }
+
+    /// Participant names, calendar and chat words become transcription hints for that meeting.
+    static var roomVocabulary: Bool {
+        get { d.object(forKey: "roomVocabulary") as? Bool ?? true }
+        set { d.set(newValue, forKey: "roomVocabulary") }
+    }
+
+    /// Where a word is uncertain, use the meeting captions' spelling of a name or term at the same moment.
+    static var captionSpelling: Bool {
+        get { d.object(forKey: "captionSpelling") as? Bool ?? true }
+        set { d.set(newValue, forKey: "captionSpelling") }
+    }
+
+    /// Warn when captions are off or the meeting page can't be read.
+    static var meetHealthWarnings: Bool {
+        get { d.object(forKey: "meetHealthWarnings") as? Bool ?? true }
+        set { d.set(newValue, forKey: "meetHealthWarnings") }
+    }
+
+    /// Recordings are stored compressed (AAC) once the final transcript is done.
+    static var compressRecordings: Bool {
+        get { d.object(forKey: "compressRecordings") as? Bool ?? true }
+        set { d.set(newValue, forKey: "compressRecordings") }
+    }
+
+    /// Delete recordings (not transcripts) older than this many days; 0 keeps them forever.
+    static var keepAudioDays: Int {
+        get { d.object(forKey: "keepAudioDays") as? Int ?? 0 }
+        set { d.set(newValue, forKey: "keepAudioDays") }
+    }
 
     /// Use the meeting app's caption language (Google Meet) instead of the language picked in Earshot.
     static var followMeetingLanguage: Bool {
@@ -205,6 +248,18 @@ enum Settings {
         set { d.set(newValue, forKey: "autoExportFormats") }
     }
 
+    /// Markdown writes participants and speaker labels as [[Name]] links.
+    static var obsidianLinks: Bool {
+        get { d.object(forKey: "obsidianLinks") as? Bool ?? false }
+        set { d.set(newValue, forKey: "obsidianLinks") }
+    }
+
+    /// Folder of daily notes (YYYY-MM-DD.md): each auto-exported meeting is appended as a link.
+    static var obsidianDailyNote: String? {
+        get { d.string(forKey: "obsidianDailyNote") }
+        set { d.set(newValue, forKey: "obsidianDailyNote") }
+    }
+
     // MARK: Appearance
 
     /// "system", "light" or "dark".
@@ -242,6 +297,7 @@ enum Settings {
 
     /// CFBundleShortVersionString; "dev" for a bare `swift run`.
     static let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+    static let appBuild = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "dev"
 }
 
 struct APIError: Error {

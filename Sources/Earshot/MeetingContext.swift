@@ -43,7 +43,8 @@ struct MeetingParticipant: Codable, Sendable, Hashable {
 struct MeetingEvent: Codable, Sendable, Hashable {
     enum Kind: String, Codable, Sendable, Hashable {
         case joined, left, presentingStarted, presentingStopped, chat, muted, unmuted, selfMuted, selfUnmuted,
-             handRaised, notetakerJoined, waiting, ended
+             handRaised, notetakerJoined, waiting, ended,
+             reaction, screenShareStarted, screenShareStopped, joinedElsewhere, captionsOn, captionsOff
     }
     var t: Double
     var kind: Kind
@@ -69,6 +70,8 @@ struct CalendarInfo: Codable, Sendable, Hashable {
     var start: Date?
     var end: Date?
     var attendees: [Attendee] = []
+    /// Same for every occurrence of a recurring event, so meetings of one series can be grouped.
+    var seriesID: String? = nil
 
     struct Attendee: Codable, Sendable, Hashable {
         var name: String?

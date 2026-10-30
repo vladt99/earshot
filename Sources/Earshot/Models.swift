@@ -69,7 +69,7 @@ enum ModelCatalog {
                                     kind: .speakers, bytes: 22_000_000, repo: "FluidInference/speaker-diarization-coreml")
     static let echo = ModelInfo(id: "localvqe", name: "LocalVQE v1.3", purpose: "Echo cancellation for your microphone",
                                 kind: .echo, bytes: 20_000_000, repo: "FluidInference/localvqe-coreml")
-    /// Only downloaded once the user adds Custom Vocabulary words.
+    /// Only downloaded once Custom Vocabulary gets words (or from Settings / the API); boosting never downloads it.
     static let vocabulary = ModelInfo(id: "parakeet-ctc-110m", name: "Parakeet CTC 110M", purpose: "Custom vocabulary (names, project terms)",
                                       kind: .vocabulary, bytes: 100_000_000, repo: "FluidInference/parakeet-ctc-110m-coreml")
     /// Only downloaded once a language other than English is picked (or from Settings / the API).

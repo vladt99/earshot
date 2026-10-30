@@ -15,6 +15,9 @@ struct EarshotApp: App {
         }
         .windowBackgroundDragBehavior(.enabled)
         .defaultSize(width: 1280, height: 820)
+        .commands {
+            CommandGroup(after: .appInfo) { CheckForUpdatesButton() }
+        }
 
         SwiftUI.Settings {
             SettingsWindow().environment(state)
@@ -48,10 +51,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         API.start()
         Task { @MainActor in
+            Updater.shared.start()
             AppState.shared.bootstrap()
             Notifier.requestAuthorization()
             CalendarLookup.requestAccess()
             MeetingDetector.shared.start()
+            PreJoinWatcher.shared.start()
             FolderWatcher.shared.reload()
         }
     }

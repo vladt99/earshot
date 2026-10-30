@@ -31,7 +31,66 @@ enum PostProcess {
     static func finished(_ t: Transcript) {
         if Settings.playSoundWhenFinished { Task { @MainActor in NSSound(named: "Glass")?.play() } }
         guard let folder = Settings.autoExportFolder else { return }
-        export([t], to: URL(fileURLWithPath: folder), formats: Settings.autoExportFormats)
+        var names: [String] = []
+        export([t], to: URL(fileURLWithPath: folder), formats: Settings.autoExportFormats) { names.append($0) }
+        if t.origin == "meeting", let daily = Settings.obsidianDailyNote, !daily.isEmpty,
+           let file = names.first(where: { $0.hasSuffix(".md") }).map({ String($0.dropLast(3)) }) ?? names.first {
+            appendToDailyNote(t, link: file, folder: dailyNoteFolder(daily))
+        }
+    }
+
+    private static let day: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
+    private static let time: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "HH:mm"
+        return f
+    }()
+
+    /// The daily notes folder: "~/…" expanded, and a relative path taken from the home folder (an app's working
+    /// directory is /).
+    static func dailyNoteFolder(_ setting: String, home: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL {
+        let path = (setting as NSString).expandingTildeInPath
+        return path.hasPrefix("/") ? URL(fileURLWithPath: path, isDirectory: true) : home.appendingPathComponent(path, isDirectory: true)
+    }
+
+    /// The line for a meeting, or nil when it is already linked in `existing` (a re-export). Keeps the note's line
+    /// endings, and starts on a new line when the note doesn't end with one.
+    static func dailyNoteLine(_ entry: String, link: String, id: String, existing: Data?) -> String? {
+        let text = existing.map { String(decoding: $0, as: UTF8.self) } ?? ""
+        let base = link.replacingOccurrences(of: " \(id.prefix(6))", with: "")
+        if [link, base, base + " " + id.prefix(6)].contains(where: { text.contains("[[" + $0 + "]]") }) { return nil }
+        let newline = text.contains("\r\n") ? "\r\n" : "\n"
+        let open = existing.map { !$0.isEmpty && $0.last != 0x0A && $0.last != 0x0D } ?? false
+        return (open ? newline : "") + entry + newline
+    }
+
+    /// Appends "- [[file]] HH:mm Title (participants)" to <folder>/YYYY-MM-DD.md. Existing text is never rewritten,
+    /// and a meeting already linked there (a re-export) is not added twice.
+    static func appendToDailyNote(_ t: Transcript, link: String, folder: URL) {
+        let url = folder.appendingPathComponent(day.string(from: t.createdAt) + ".md")
+        let names = Formats.people(t.context).filter { !$0.bot }.map(\.name)
+            .map { Settings.obsidianLinks && Formats.linkable($0) ? Formats.wikilink($0) : $0 }
+        let entry = "- [[\(link)]] \(time.string(from: t.createdAt)) \(t.title)" + (names.isEmpty ? "" : " (\(names.joined(separator: ", ")))")
+        guard let line = dailyNoteLine(entry, link: link, id: t.id, existing: try? Data(contentsOf: url)) else { return }
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            // O_APPEND: two meetings finishing at once both land, neither overwrites the other.
+            let fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT, 0o644)
+            guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+            let h = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+            defer { try? h.close() }
+            try h.write(contentsOf: Data(line.utf8))
+        } catch {
+            let message = "Could not add the meeting to the daily note \(url.lastPathComponent): \(error.localizedDescription)"
+            Task { @MainActor in AppState.shared.lastError = message }
+        }
     }
 
     private static let stamp: DateFormatter = {
@@ -66,7 +125,7 @@ enum PostProcess {
 
     /// Batch Export / Auto-Export: one file per transcript and format. Failures are reported in AppState.lastError.
     @discardableResult
-    static func export(_ items: [Transcript], to folder: URL, formats: [String]) -> Int {
+    static func export(_ items: [Transcript], to folder: URL, formats: [String], wrote: (String) -> Void = { _ in }) -> Int {
         var written = 0
         var failed: [String] = []
         let fm = FileManager.default
@@ -83,6 +142,7 @@ enum PostProcess {
                 do {
                     try body.write(to: url, options: .atomic)
                     written += 1
+                    wrote(url.lastPathComponent)
                 } catch {
                     failed.append("\(url.lastPathComponent): \(error.localizedDescription)")
                 }

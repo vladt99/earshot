@@ -8,6 +8,7 @@ struct HomeView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            if !state.lostGrants.isEmpty { PermissionsCard() }
             NowCard()
             if !state.speechReady || ModelCatalog.speech.contains(where: { state.downloads[$0.id] != nil }) {
                 SetupCard()
@@ -83,6 +84,7 @@ private struct NowCard: View {
                     }
                     if m.lines.isEmpty { Text("Listening…").font(.callout).foregroundStyle(.secondary) }
                     if let w = m.warning { Label(w, systemImage: "exclamationmark.triangle.fill").font(.callout).foregroundStyle(.orange) }
+                    MeetHints(meeting: m, compact: true)
                     GlassEffectContainer {
                         HStack(spacing: 6) {
                             Button("Live Transcript") { MeetingPanel.shared.show() }
@@ -267,6 +269,40 @@ private struct QuickStart: View {
 }
 
 /// First launch: speech models downloading.
+/// After an update macOS forgets Earshot's permissions (each ad hoc signed build is a new app to it).
+private struct PermissionsCard: View {
+    @Environment(AppState.self) private var state
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            CardHeader(title: "Permissions", icon: "lock.shield")
+            Text("Earshot was updated — macOS needs your permission again").font(.headline)
+            Text("macOS treats each new version as a new app, so it forgot what you allowed before.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            ForEach(state.lostGrants, id: \.self) { g in
+                HStack {
+                    Label(g == .microphone ? "Microphone" : "Accessibility", systemImage: g == .microphone ? "mic" : "accessibility")
+                    Text(g == .microphone ? "records your side of calls" : "reads Meet for names, captions and mute")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Allow…") { state.restoreGrant(g) }.buttonStyle(.glass).controlSize(.small)
+                }
+            }
+            HStack {
+                Label("System Audio Recording", systemImage: "speaker.wave.2")
+                Text("can't be checked: allow it again if calls record only your voice").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("Open…") { AppState.openPrivacyPane("Privacy_ScreenCapture") }.buttonStyle(.glass).controlSize(.small)
+            }
+            HStack {
+                Spacer()
+                Button("Dismiss") { state.dismissLostGrants() }.buttonStyle(.glass).controlSize(.small)
+            }
+        }
+        .card(tint: .orange)
+    }
+}
+
 private struct SetupCard: View {
     @Environment(AppState.self) private var state
 

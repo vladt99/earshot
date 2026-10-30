@@ -31,18 +31,26 @@ MCP server let your other apps and agents use the transcripts.
   German, Spanish, …) and Earshot switches to Whisper large-v3-turbo with that language forced, which handles
   accents, names and mixed-in English far better.
 - **Clean final transcript.** When the call ends, the live text is saved right away. Both recordings are then
-  re-transcribed in one pass with full context: about a minute for an hour-long call in English, roughly a third of
-  the call's length with Whisper.
+  re-transcribed in one pass with full context: about a minute for an hour-long call in English, a few minutes with
+  Whisper (silence is skipped, so muted stretches cost nothing).
 - **Note taking.** Press ⌃⌘B from any app to bookmark a moment, or type notes in the live panel. They are saved on
   the transcript's timeline.
-- **Custom vocabulary.** Teach it names and jargon ("Kubernetes", your colleagues' names) and it corrects them.
+- **Custom vocabulary, plus the room's.** Teach it names and jargon ("Kubernetes", your colleagues' names) and it
+  corrects them. In a meeting it also uses the participants' names and words from the calendar invite and chat as
+  hints, and where it isn't sure of a name or term it takes the spelling Meet's captions show at that moment.
 - **Reliable capture.** Echo cancellation keeps the other side out of your mic track on laptop speakers and turns
   itself off on headphones and AirPods. Capture follows you when you switch devices, including AirPods switching to
   call mode, falls back to all system audio if an app's own audio stays silent, warns you when an input goes
   silent, and a meeting interrupted by a crash, power loss or quitting is saved or recovered.
+- **Storage that stays small.** Recordings are compressed to AAC once the transcript is done (about 8× smaller), and
+  can be deleted automatically after 7, 30, 90 or 365 days while the transcripts stay.
+- **Meeting series and people.** Recurring meetings are grouped with Previous / Next, links and emails from the chat
+  are collected per meeting, and the API and MCP server answer "everything Maya said this month".
 - **Everything else you'd expect:** file and watched-folder transcription (audio, video, YouTube links), voice memos,
   dictation, live captions, a full-text search, folders, people, export to TXT, SRT, VTT, Markdown and JSON, and
-  auto-export to a folder (an Obsidian vault works well).
+  auto-export to a folder, with Obsidian `[[links]]` for people and a line in your daily note if you want.
+- **Updates itself** (with your permission) and has a Copy Diagnostics button for bug reports that leaves out names,
+  titles and transcript text.
 - **Built for automation:** an OpenAI-compatible local API, live Server-Sent Events, signed webhooks, an MCP server
   for Claude and other agents, and a URL scheme for Shortcuts, Raycast and Alfred.
 
@@ -62,9 +70,9 @@ MCP server let your other apps and agents use the transcripts.
 | **Mac** | Apple silicon (M1 or later). Intel Macs are not supported |
 | **Memory** | 8 GB minimum, 16 GB recommended for long meetings |
 | **Disk** | About 650 MB for the app and speech models, 1.6 GB more for languages other than English, plus about 230 MB per hour of recorded meeting |
-| **Network** | Only to download the speech models from Hugging Face: ≈ 525 MB on first launch, ≈ 1.6 GB more the first time you pick a language other than English |
+| **Network** | To download the speech models from Hugging Face (≈ 525 MB on first launch, ≈ 1.6 GB more the first time you pick a language other than English) and, if you allow it, to check GitHub for updates |
 | **Languages** | English and auto-detect: Parakeet TDT v3. Any other language: Whisper large-v3-turbo (99 languages), with the language you pick forced |
-| **Speaker names from captions** | Google Meet in Chrome or another Chromium browser (Edge, Brave, Arc, Vivaldi), with captions (CC) on |
+| **Speaker names from captions** | Google Meet in Chrome or another Chromium browser (Dia, Edge, Brave, Arc, Vivaldi), with captions (CC) on |
 
 ## Install
 
@@ -91,10 +99,15 @@ MCP server let your other apps and agents use the transcripts.
 5. Leave it running while the speech models download (≈ 525 MB, shown on the Overview). It then lives in the menu
    bar and asks you when a call starts. To record calls automatically, go to Settings → Record Meetings.
 
-To update, replace the app in Applications. Your transcripts, settings and models are kept. Releases are signed ad
-hoc, so macOS treats each version as a new app: allow Microphone and System Audio Recording again when asked, and
-for Accessibility remove Earshot from **System Settings → Privacy & Security → Accessibility** and add it again.
-Settings → Note Taker tells you when the old grant no longer applies.
+**Updates.** From 0.12 on, Earshot updates itself: on the second launch it asks whether to check for updates
+automatically, and **Check for Updates…** is in the app menu, the menu bar panel and Settings → About. Updates are
+signed (EdDSA) and come from this repository's releases. Coming from 0.11 or earlier, install 0.12 once by hand
+(replace the app in Applications). Keep Earshot in Applications so the updater can replace it.
+
+Releases are signed ad hoc, so macOS treats each version as a new app. After an update the Overview shows
+**Earshot was updated — macOS needs your permission again** with a button for each pane: allow Microphone and
+System Audio Recording again, and for Accessibility remove Earshot from **System Settings → Privacy & Security →
+Accessibility** and add it again. Transcripts, settings and models are kept.
 
 To uninstall, delete the app and, if you want to remove your data as well,
 `~/Library/Application Support/Earshot` (transcripts and recordings) and
@@ -104,12 +117,19 @@ To uninstall, delete the app and, if you want to remove your data as well,
 
 1. Grant **Accessibility** once (Settings → Note Taker → Grant Access). Earshot needs it to read Meet's page: who is
    in the call, captions, mute state and the end screen.
-2. Join the call in your browser (Chrome, Dia, Arc, Edge, Brave, Vivaldi). Earshot shows **Meeting detected**.
-   Click **Transcribe**, or pick "Record automatically" in Settings → Record Meetings. **Live Captions** only shows
-   text; during a call it's saved as a meeting too, unless you turn that off in Settings.
-3. Turn on **captions (CC)** in Meet for real names instead of Speaker 1, 2, …. Earshot only uses the captions to
+2. Open the call in your browser (Chrome, Dia, Arc, Edge, Brave, Vivaldi). On Meet's **Ready to join?** screen
+   Earshot shows **Before you join**: pick the language (Auto follows Meet's captions) and whether to record, show
+   Live Captions or do nothing. It does that when you click Join, and remembers the choice for that meeting and its
+   calendar series. Without that screen, Earshot shows **Meeting detected** once you're in: click **Transcribe**, or
+   pick "Record automatically" in Settings → Record Meetings. **Live Captions** only shows text; during a call it's
+   saved as a meeting too, unless you turn that off in Settings.
+3. Captions (CC) give real names instead of Speaker 1, 2, …. Earshot turns them on for you once per call (they show
+   only on your screen; turn that off in Settings → Record Meetings) and reminds you if they're off. It only uses the captions to
    see who is speaking, and their language to pick the engine (English → Parakeet, anything else → Whisper, which
-   downloads once, 1.6 GB). The transcript text comes from its own model.
+   downloads once, 1.6 GB). The transcript text comes from its own model. A voice no caption named stays
+   "Speaker 2"; Earshot then asks **Who is this?** with the people from the call who aren't named yet (in the panel
+   once they've talked for a while, and above the saved transcript with a clip to play). The name sticks to that
+   voice in later meetings. Picking the same name for two speakers merges them.
 4. Use headphones or AirPods if you can. Echo cancellation helps on laptop speakers, but headphones give the
    cleanest audio.
 5. Leave the call. Earshot stops as soon as Meet shows its end screen, saves the transcript and replaces it with
@@ -133,7 +153,9 @@ Nothing is bundled with the app. Each model downloads once from Hugging Face:
 The FluidAudio models live in `~/Library/Application Support/FluidAudio/Models/`, Whisper in
 `~/Library/Application Support/Earshot/Models/whisperkit/`. Settings → Local Models shows them all and can delete or
 re-download each one. Transcripts and recordings are in `~/Library/Application Support/Earshot/`. Each
-meeting has its own folder with `others.wav` (the other participants) and `me.wav` (you).
+meeting has its own folder with `others` (the other participants) and `me` (you): WAV while recording, compressed to
+AAC (`.m4a`) once the final transcript is saved. Settings → Storage shows how much space recordings use, can keep
+them for a limited time (transcripts and starred lines are never deleted), and can delete old ones now.
 
 ## Performance
 
@@ -216,14 +238,14 @@ The OpenAI SDKs work with `base_url="http://127.0.0.1:7788/v1"` and the token as
 | `POST /v1/transcripts/{id}/translate` `{"target": "de"}` | On-device translation |
 | `DELETE /v1/transcripts/{id}[?permanent=true]` | Move to Recently Deleted, or delete for good |
 | `GET /v1/search?q=&limit=&origin=` | Full-text search; each hit has a `snippet` and the matching lines with speaker and time |
-| `POST /v1/transcripts/{id}/speakers` `{"from": "Speaker 1", "to": "Maya"}` | Rename a speaker; for meetings this also remembers Maya's voice |
+| `POST /v1/transcripts/{id}/speakers` `{"from": "Speaker 1", "to": "Maya"}` | Rename a speaker; for meetings this also remembers Maya's voice. A name another speaker already has merges the two |
 | `GET /v1/voices` · `DELETE /v1/voices/{name}` | Remembered voices |
 
 ### Meetings and live events
 
 | Method & path | What |
 |---|---|
-| `GET /v1/events[?filter=meeting.,job.]` | Server-Sent Events: `meeting.detected`, `meeting.started`, `meeting.partial`, `meeting.segment`, `meeting.speakers_revised`, `meeting.note`, `meeting.warning`, `meeting.capture_restarted`, `meeting.ended_detected`, `meeting.resumed_after_sleep`, `meeting.saved`, `meeting.polishing`, `meeting.finalized`, `meeting.retranscribed`, `meeting.recovered`, `meeting.kept`, `meeting.mic_muted`, `meeting.mic_unmuted`, `audio.tap_fallback`, `audio.echo_cancellation_bypassed`, `job.done`, `job.failed`. `filter` takes prefixes (`meeting.`) or `*` |
+| `GET /v1/events[?filter=meeting.,job.]` | Server-Sent Events: `meeting.detected`, `meeting.prejoin`, `meeting.started`, `meeting.partial`, `meeting.segment`, `meeting.speakers_revised`, `meeting.note`, `meeting.warning`, `meeting.capture_restarted`, `meeting.ended_detected`, `meeting.resumed_after_sleep`, `meeting.saved`, `meeting.polishing`, `meeting.finalized`, `meeting.retranscribed`, `meeting.recovered`, `meeting.kept`, `meeting.speaker_named`, `meeting.mic_muted`, `meeting.mic_unmuted`, `audio.tap_fallback`, `audio.echo_cancellation_bypassed`, `job.done`, `job.failed`. `filter` takes prefixes (`meeting.`) or `*` |
 | `GET /v1/meetings/current[?format=text]` | The running meeting's live transcript, notes, warnings, `context`, `self_muted`, `live_captions` and `saved` |
 | `POST /v1/meetings/current/keep` | Save the running Live Captions as a meeting |
 | `POST /v1/meetings/current/notes` `{"text"}` · `POST /v1/meetings/current/bookmark` | Add a note or bookmark now |
@@ -231,7 +253,11 @@ The OpenAI SDKs work with `base_url="http://127.0.0.1:7788/v1"` and the token as
 | `POST /v1/meetings/start` `{"app"?: bundle id or "system", "title"?, "mic"?: true}` | Start recording (defaults to the detected app) |
 | `POST /v1/meetings/stop` | Stop and save. Returns the live transcript; `polishing` says whether a final version follows as `meeting.finalized` |
 | `GET /v1/meetings` | Saved meetings, with `participants`, `meeting_code`, `meeting_url` and `platform` |
-| `POST /v1/meetings/{id}/retranscribe` | Re-transcribe both recordings at full quality |
+| `POST /v1/meetings/{id}/retranscribe` | Re-transcribe both recordings at full quality (409 when the recording was deleted) |
+| `GET /v1/meetings?series=` | Meetings of one series (a `series_id` from the list, a calendar series id or a title) |
+| `GET /v1/speakers` | Every named speaker with meeting count, line count and last seen |
+| `GET /v1/speakers/{name}/lines?limit=&since=&q=` | One person's lines across all meetings, newest first; matches names case- and accent-insensitively, and first names or emails through the participant list |
+| `GET /v1/diagnostics` | The same plain-text report as Settings → About → Copy Diagnostics |
 
 ### Models, settings, dictation
 
@@ -239,7 +265,8 @@ The OpenAI SDKs work with `base_url="http://127.0.0.1:7788/v1"` and the token as
 |---|---|
 | `GET /v1/models` | Every model with `installed`, `bytes_on_disk`, `download_bytes`, `path` |
 | `POST /v1/models/download` `{"model"}` · `DELETE /v1/models/{id}` | Download or remove `parakeet-tdt-v3`, `whisper-large-v3-turbo`, `speaker-diarization`, `localvqe`, `parakeet-ctc-110m` |
-| `GET` / `PATCH /v1/settings` | `meeting_mode` (`ask`, `auto`, `off`), `meeting_apps`, `auto_stop_after_meeting`, `auto_dismiss_meeting_alerts`, `diarize_meetings`, `diarize_files`, `participants_name`, `my_name`, `echo_cancellation`, `language`, `watched_folders`, `polish_after_meeting`, `auto_name_speakers`, `remember_voices`, `vocabulary`, `bookmark_hotkey`, `audio_warnings`, `webhooks`, `webhook_events`, `auto_export_folder`, `auto_export_formats`, `follow_meeting_language`, `respect_mute`, `keep_live_captions_of_calls`, `txt_header` |
+| `GET` / `PATCH /v1/settings` | `meeting_mode` (`ask`, `auto`, `off`), `meeting_apps`, `auto_stop_after_meeting`, `auto_dismiss_meeting_alerts`, `prejoin_overlay`, `diarize_meetings`, `diarize_files`, `participants_name`, `my_name`, `echo_cancellation`, `language`, `watched_folders`, `polish_after_meeting`, `auto_name_speakers`, `remember_voices`, `vocabulary`, `bookmark_hotkey`, `audio_warnings`, `webhooks`, `webhook_events`, `auto_export_folder`, `auto_export_formats`, `follow_meeting_language`, `respect_mute`, `keep_live_captions_of_calls`, `txt_header`, `auto_enable_captions`, `meet_health_warnings`, `room_vocabulary`, `caption_spelling`, `compress_recordings`, `keep_audio_days` (0 = forever), `obsidian_links`, `obsidian_daily_note` |
+| `POST /v1/recordings/cleanup` | Delete the recordings older than `keep_audio_days` now (setting it only takes effect at the next daily run). Returns `deleted` and `bytes_freed` |
 | `GET /v1/dictation` · `POST /v1/dictation/start` · `stop` · `cancel` | Microphone dictation; `stop` returns the transcript |
 
 A saved meeting's verbose JSON (and its webhooks) carries a `context` object: `platform`, `meeting_code`, `url`,
@@ -268,8 +295,8 @@ claude mcp add earshot -- /Applications/Earshot.app/Contents/MacOS/earshot-mcp
 ```
 
 Transcripts come with the room and participant list, so "what did the guest from Acme ask?" works. Tools:
-`search_transcripts`, `list_meetings`, `get_transcript`, `current_meeting`, `start_meeting`, `stop_meeting`,
-`add_meeting_note`, `transcribe_file`. Earshot must be running.
+`search_transcripts`, `list_meetings` (optionally one `series`), `get_transcript`, `speaker_lines`, `list_speakers`,
+`current_meeting`, `start_meeting`, `stop_meeting`, `add_meeting_note`, `transcribe_file`. Earshot must be running.
 
 ### URL scheme
 
@@ -299,6 +326,16 @@ Builds are signed ad hoc, so macOS asks for permissions again after every rebuil
 identity: create a `.signing.env` (git-ignored) with `SIGN_IDENTITY="Your Certificate Name"`, plus `SIGN_KEYCHAIN`
 and `SIGN_KEYCHAIN_PASSWORD_FILE` if the certificate is in its own keychain.
 
+Tests cover the pure logic (Meet page parsing, pre-join, speaker pipeline, caption spelling, formats, diagnostics
+redaction) and need no models or devices: `swift test`.
+
+To publish a release: bump `CFBundleShortVersionString` and `CFBundleVersion` in Info.plist, commit, then run
+`scripts/release.sh <version>`. It builds the zip, signs it for Sparkle with the EdDSA key in your login keychain
+(account `earshot`), updates `appcast.xml`, and prints the remaining steps. It refuses a dirty tree, a build number
+that didn't go up, and a version that's already released. Back up the key once with
+`generate_keys --account earshot -x <file>` (Sparkle's tool, under `.build/artifacts`) and keep the file outside the
+repo: without it, existing installs can't be updated.
+
 For debugging live transcription, run `defaults write io.github.vladt99.Earshot liveDebug -bool true`; the log is
 written to `~/Library/Application Support/Earshot/live-debug.log`.
 
@@ -320,6 +357,12 @@ Sources/Earshot/
   Meeting.swift          meeting sessions, live transcription, live speakers, notes, watchdog, final pass
   Notetaker.swift        crash recovery, speaker naming (captions, voices), bookmark hotkey
   MeetObserver.swift     Google Meet through the accessibility tree: room, people, captions, mute, chat, end
+  PreJoin.swift          "Before you join" overlay on Meet's green room, remembered choices
+  SpeakerPicker.swift    "Who is this?" candidates and clips for unnamed voices
+  CaptionSpelling.swift  room vocabulary, spelling names from captions, vocabulary safety checks
+  MeetingAudio.swift     meeting tracks (WAV/AAC), compression
+  AudioRetention.swift   deleting old recordings
+  Series.swift, SpeakerLines.swift, Diagnostics.swift, Updater.swift
   MeetingContext.swift   the meeting context saved with each meeting
   UI/MeetingInfo.swift   Meeting tab: room, calendar, participants, timeline
   AudioCapture.swift     Core Audio process tap, ring buffer, gap filling, microphone
@@ -333,6 +376,7 @@ Sources/Earshot/
   Webhooks.swift         signed event delivery
   HTTPServer.swift, API.swift, Events.swift, Formats.swift, Models.swift, Settings.swift
 Sources/EarshotMCP/main.swift   MCP server (stdio) over the local API
+Tests/EarshotTests/             unit tests (swift test)
 ```
 
 ## How it works
@@ -359,18 +403,21 @@ Sources/EarshotMCP/main.swift   MCP server (stdio) over the local API
 
 ## Status and known limitations
 
-Earshot is young (0.10). What has been tested and what hasn't:
+Earshot is young (0.12). What has been tested and what hasn't:
 
 - Tested: call detection, live and final transcription in English and Romanian, AirPods in call mode, speaker
   separation, naming speakers from Meet captions on a recorded 40-minute call (96 % agreement with Meet's own
   captions), remembered voices, bookmarks and notes, crash recovery, search, export, webhooks, the API and the MCP
   server.
-- Not yet tested in a live call: not recording the mic while muted, stopping at Meet's end screen, switching the
-  engine to Meet's caption language, live names, a full call with live Whisper, FaceTime, switching audio devices
-  mid-call, and the silent-input warnings. Reports are welcome.
+- Tested in a live 14-minute Romanian Meet call in Dia on AirPods (0.11): the Before you join screen, all 8 speakers
+  named from captions, the mic blanked while muted, the engine following Meet's caption language, live Whisper, and
+  stopping at Meet's end screen.
+- Not yet tested in a live call: turning captions on automatically, the Meet health warning, room vocabulary and
+  caption spelling live, naming a voice from the live panel, updating through Sparkle, FaceTime, switching audio
+  devices mid-call and the silent-input warnings. Reports are welcome.
 - Meet support depends on Meet's page labels, which Google can change. English is verified; other Meet interface
   languages are best guesses.
-- Only people who get captions can be named; others stay Speaker N until you name them once.
+- Only people who get captions can be named; others stay Speaker N until you name them once (Who is this?).
 - Live speaker labels can change during the first minute while the model learns the voices. The final pass is more
   accurate.
 - On laptop speakers without headphones, some of the other side can still reach your microphone track.
@@ -380,8 +427,9 @@ Earshot is young (0.10). What has been tested and what hasn't:
 ## Privacy
 
 Audio, transcripts and voice profiles stay on your Mac. Earshot connects to the internet only to download models
-from Hugging Face, to fetch a YouTube link you paste, and to send webhooks you configure yourself. The API only
-listens on 127.0.0.1.
+from Hugging Face, to fetch a YouTube link you paste, to send webhooks you configure yourself, and (if you allow it)
+to check this repository for updates. The API only listens on 127.0.0.1. Copy Diagnostics never includes names,
+meeting titles, codes, device names or transcript text.
 
 ## Credits
 
@@ -390,8 +438,9 @@ listens on 127.0.0.1.
 - [NVIDIA Parakeet TDT v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) (CC BY 4.0)
 - [WhisperKit](https://github.com/argmaxinc/WhisperKit) (MIT) and [OpenAI Whisper large-v3-turbo](https://huggingface.co/openai/whisper-large-v3-turbo) (MIT)
 - [pyannote](https://github.com/pyannote/pyannote-audio) speaker diarization (MIT)
+- [Sparkle](https://sparkle-project.org) (MIT) for updates
 
 ## License
 
 Public domain ([Unlicense](LICENSE)). Do anything you like with it: use, copy, modify, sell, no attribution needed.
-The speech models, FluidAudio and WhisperKit keep their own licences (listed under Credits).
+The speech models, FluidAudio, WhisperKit and Sparkle keep their own licences (listed under Credits).

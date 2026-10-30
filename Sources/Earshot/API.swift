@@ -90,7 +90,8 @@ enum API {
                                              offset: Int(req.query["offset"] ?? "") ?? 0,
                                              query: req.query["q"].flatMap { $0.isEmpty ? nil : $0 },
                                              origin: req.query["origin"])
-                return .json(["data": list.map(Formats.summary)])
+                let series = Store.shared.seriesIndex().byMeeting
+                return .json(["data": list.map { Formats.summary($0, series: series) }])
             case ("GET", let p) where p.count == 3 && p[0] == "v1" && p[1] == "transcripts":
                 guard let t = Store.shared.get(p[2]) else { throw APIError(404, "No such transcript") }
                 return Formats.render(t, as: req.query["format"] ?? "verbose_json")
@@ -106,10 +107,7 @@ enum API {
                 guard let from = body["from"] as? String, let to = (body["to"] as? String)?.trimmingCharacters(in: .whitespaces), !to.isEmpty else {
                     throw APIError(400, "Body must be {\"from\": \"Speaker 1\", \"to\": \"Name\"}")
                 }
-                await MainActor.run {
-                    AppState.shared.addPerson(to)
-                    AppState.shared.renameSpeaker(in: t, from: from, to: to)
-                }
+                await MainActor.run { AppState.shared.nameSpeaker(in: t, from: from, to: to) }
                 return Formats.render(Store.shared.get(p[2]) ?? t, as: "verbose_json")
             case ("POST", ["v1", "import", "url"]):
                 let body = req.jsonObject
@@ -131,10 +129,7 @@ enum API {
                 let filter = req.query["filter"].map { Set($0.split(separator: ",").map(String.init)) }
                 return .events(EventBus.shared.subscribe(filter: filter))
 
-            case ("GET", ["v1", "meetings"]):
-                let list = Store.shared.list(limit: Int(req.query["limit"] ?? "") ?? 50, offset: Int(req.query["offset"] ?? "") ?? 0,
-                                             query: req.query["q"].flatMap { $0.isEmpty ? nil : $0 }, origin: "meeting")
-                return .json(["data": list.map(Formats.summary)])
+            case ("GET", ["v1", "meetings"]): return meetings(req)
             case ("GET", ["v1", "meetings", "current"]): return await currentMeeting(format: req.query["format"])
             case ("GET", ["v1", "meetings", "detected"]):
                 let d = await MainActor.run { MeetingDetector.shared.detect() }
@@ -191,14 +186,36 @@ enum API {
                     return d
                 }])
 
+            case ("GET", ["v1", "speakers"]):
+                if let s = req.query["since"], !s.isEmpty, SpeakerLines.date(s) == nil { throw APIError(400, "since must be a date like 2026-10-01") }
+                return .json(["data": SpeakerLines.all(since: SpeakerLines.date(req.query["since"]), origin: req.query["origin"].flatMap { $0.isEmpty ? nil : $0 })])
+            case ("GET", let p) where p.count >= 4 && p[0] == "v1" && p[1] == "speakers" && p.last == "lines":
+                // A name with "/" arrives split; put it back together.
+                let name = p[2..<(p.count - 1)].joined(separator: "/")
+                if let s = req.query["since"], !s.isEmpty, SpeakerLines.date(s) == nil { throw APIError(400, "since must be a date like 2026-10-01") }
+                let (lines, meetings) = SpeakerLines.lines(name, limit: Int(req.query["limit"] ?? "") ?? 50, since: SpeakerLines.date(req.query["since"]),
+                                                           origin: req.query["origin"].flatMap { $0.isEmpty ? nil : $0 },
+                                                           query: req.query["q"].flatMap { $0.isEmpty ? nil : $0 })
+                return .json(["name": name, "meetings": meetings, "data": lines])
+
+            case ("GET", ["v1", "diagnostics"]):
+                return .text(await Diagnostics.report())
+
             case ("GET", ["v1", "voices"]):
                 return .json(["data": Store.shared.voices().keys.sorted()])
             case ("DELETE", let p) where p.count == 3 && p[0] == "v1" && p[1] == "voices":
                 Store.shared.forgetVoice(p[2])
                 return .json(["deleted": true, "name": p[2]])
             case ("POST", let p) where p.count == 4 && p[0] == "v1" && p[1] == "meetings" && p[3] == "retranscribe":
+                if let t = Store.shared.get(p[2]), AudioRetention.audio(t) == .deleted { throw APIError(409, "The recording of this meeting was deleted") }
                 let t = try await MeetingController.shared.retranscribe(p[2])
                 return Formats.render(t, as: req.query["format"] ?? "verbose_json")
+
+            case ("POST", ["v1", "recordings", "cleanup"]):
+                // Deletes the recordings older than keep_audio_days now, instead of at the next daily run.
+                let days = Settings.keepAudioDays
+                let (count, bytes) = await AudioRetention.run(olderThan: days)
+                return .json(["keep_audio_days": days, "deleted": count, "bytes_freed": bytes])
 
             case ("GET", ["v1", "settings"]): return .json(SettingsAPI.current())
             case ("PATCH", ["v1", "settings"]), ("POST", ["v1", "settings"]):
@@ -309,6 +326,27 @@ enum API {
         d["saved"] = await MainActor.run { AppState.shared.willSave(m) }
         d["context"] = m.context.map { Formats.context($0) } ?? NSNull()
         return .json(d)
+    }
+
+    /// Meetings, newest first; `series=` keeps one series (a `series_id` from this list, a calendar series id or a title).
+    private static func meetings(_ req: HTTPRequest) -> HTTPResponse {
+        let limit = max(1, min(Int(req.query["limit"] ?? "") ?? 50, 500)), offset = max(0, Int(req.query["offset"] ?? "") ?? 0)
+        let q = req.query["q"].flatMap { $0.isEmpty ? nil : $0 }
+        let series = Store.shared.seriesIndex()
+        let index = series.byMeeting
+        var list: [Transcript]
+        if let s = req.query["series"], !s.isEmpty {
+            // Filter and page the ids, then load only that page.
+            var ids = Series.find(s, in: series) ?? []
+            if let q {
+                let hits = Store.shared.searchIDs(q)
+                ids = ids.filter { hits.contains($0) || series.names[$0]?.localizedCaseInsensitiveContains(q) == true }
+            }
+            list = ids.dropFirst(offset).prefix(limit).compactMap(Store.shared.get)
+        } else {
+            list = Store.shared.list(limit: limit, offset: offset, query: q, origin: "meeting")
+        }
+        return .json(["data": list.map { Formats.summary($0, series: index) }])
     }
 
     private static func dictationState() async -> HTTPResponse {
@@ -458,6 +496,7 @@ enum SettingsAPI {
             "meeting_mode": Settings.meetingMode,
             "auto_stop_after_meeting": Settings.autoStopAfterMeeting,
             "auto_dismiss_meeting_alerts": Settings.autoDismissMeetingAlerts,
+            "prejoin_overlay": Settings.preJoinOverlay,
             "participants_name": Settings.participantsName,
             "meeting_apps": Settings.meetingApps,
             "diarize_meetings": Settings.diarizeMeetings,
@@ -481,6 +520,14 @@ enum SettingsAPI {
             "webhook_events": Settings.webhookEvents,
             "auto_export_folder": Settings.autoExportFolder ?? NSNull(),
             "auto_export_formats": Settings.autoExportFormats,
+            "auto_enable_captions": Settings.autoEnableCaptions,
+            "meet_health_warnings": Settings.meetHealthWarnings,
+            "room_vocabulary": Settings.roomVocabulary,
+            "caption_spelling": Settings.captionSpelling,
+            "compress_recordings": Settings.compressRecordings,
+            "keep_audio_days": Settings.keepAudioDays,
+            "obsidian_links": Settings.obsidianLinks,
+            "obsidian_daily_note": Settings.obsidianDailyNote ?? NSNull(),
             "port": Int(Settings.port),
         ]
     }
@@ -493,6 +540,7 @@ enum SettingsAPI {
         }
         if let v = b["auto_stop_after_meeting"] as? Bool { Settings.autoStopAfterMeeting = v }
         if let v = b["auto_dismiss_meeting_alerts"] as? Bool { Settings.autoDismissMeetingAlerts = v }
+        if let v = b["prejoin_overlay"] as? Bool { Settings.preJoinOverlay = v }
         if let v = b["participants_name"] as? String, !v.isEmpty { Settings.participantsName = v }
         if let v = b["meeting_apps"] as? [String] { Settings.meetingApps = v }
         if let v = b["diarize_meetings"] as? Bool { Settings.diarizeMeetings = v }
@@ -526,6 +574,23 @@ enum SettingsAPI {
             Settings.autoExportFolder = (b["auto_export_folder"] as? String).flatMap { $0.isEmpty ? nil : ($0 as NSString).expandingTildeInPath }
         }
         if let v = b["auto_export_formats"] as? [String] { Settings.autoExportFormats = v.filter { ["txt", "srt", "vtt", "md", "json"].contains($0) } }
+        if let v = b["auto_enable_captions"] as? Bool { Settings.autoEnableCaptions = v }
+        if let v = b["meet_health_warnings"] as? Bool { Settings.meetHealthWarnings = v }
+        if let v = b["room_vocabulary"] as? Bool { Settings.roomVocabulary = v }
+        if let v = b["caption_spelling"] as? Bool { Settings.captionSpelling = v }
+        if let v = b["compress_recordings"] as? Bool { Settings.compressRecordings = v }
+        if let raw = b["keep_audio_days"] {
+            // JSON true arrives as an NSNumber that `as? Int` takes for 1; 7.5 isn't a number of days either.
+            guard let n = raw as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID(), let v = Int(exactly: n.doubleValue), v >= 0, v <= 36500 else {
+                throw APIError(400, "keep_audio_days must be a whole number of days (0 keeps recordings forever)")
+            }
+            // Nothing is deleted now: the daily cleanup applies it, or POST /v1/recordings/cleanup.
+            Settings.keepAudioDays = v
+        }
+        if let v = b["obsidian_links"] as? Bool { Settings.obsidianLinks = v }
+        if b.keys.contains("obsidian_daily_note") {
+            Settings.obsidianDailyNote = (b["obsidian_daily_note"] as? String).flatMap { $0.isEmpty ? nil : ($0 as NSString).expandingTildeInPath }
+        }
         if let v = b["watched_folders"] as? [String] {
             Settings.watchedFolders = v.map { ($0 as NSString).expandingTildeInPath }
             await MainActor.run { FolderWatcher.shared.reload() }

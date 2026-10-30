@@ -60,6 +60,13 @@ struct MenuPanel: View {
                 Button("Open Earshot") { state.showMainWindow() }.buttonStyle(.glass)
                 Button("Settings") { state.openSettings(nil) }.buttonStyle(.glass)
                 Spacer()
+                Menu {
+                    CheckForUpdatesButton()
+                } label: {
+                    Image(systemName: "ellipsis")
+                }
+                .menuStyle(.button).buttonStyle(.glass).menuIndicator(.hidden).fixedSize()
+                .accessibilityLabel("More")
                 Button("Quit") { NSApp.terminate(nil) }.buttonStyle(.glass)
             }
             .controlSize(.small)

@@ -74,21 +74,26 @@ enum Formats {
 
     /// Meeting notes as Markdown for a notes app (Obsidian, Bear…): front matter, bookmarks and notes, then the
     /// transcript as speaker paragraphs with timestamps and the meeting chat in place.
-    static func markdown(_ t: Transcript) -> String {
+    static func markdown(_ t: Transcript, obsidian: Bool = Settings.obsidianLinks) -> String {
         let speakers = Array(Set(t.segments.compactMap(\.speaker))).sorted()
         let c = t.context, people = people(c)
+        // Obsidian: people as [[Name]] links, lists in block style (what its Properties view writes).
+        let person: (String) -> String = { obsidian && linkable($0) && $0 != "Me" ? wikilink($0) : $0 }
+        let list: ([String]) -> String = { names in
+            obsidian ? "\n" + names.map { "  - \(yaml($0))" }.joined(separator: "\n") : " [\(names.map(yaml).joined(separator: ", "))]"
+        }
         var out = "---\n"
         out += "title: \(yaml(t.title))\n"
         out += "date: \(iso(t.createdAt))\n"
         if let d = t.duration { out += "duration: \(clock(d))\n" }
         if !people.isEmpty {
-            out += "participants: [\(people.map { yaml($0.name) }.joined(separator: ", "))]\n"
+            out += "participants:\(list(people.map { $0.bot ? $0.name : person($0.name) }))\n"
             let guests = people.filter { $0.external && !$0.bot }, bots = people.filter(\.bot)
-            if !guests.isEmpty { out += "guests: [\(guests.map { yaml($0.name) }.joined(separator: ", "))]\n" }
-            if !bots.isEmpty { out += "bots: [\(bots.map { yaml($0.name) }.joined(separator: ", "))]\n" }
-            if !speakers.isEmpty { out += "speakers: [\(speakers.map(yaml).joined(separator: ", "))]\n" }
+            if !guests.isEmpty { out += "guests:\(list(guests.map { person($0.name) }))\n" }
+            if !bots.isEmpty { out += "bots:\(list(bots.map(\.name)))\n" }
+            if !speakers.isEmpty { out += "speakers:\(list(speakers.map(person)))\n" }
         } else if !speakers.isEmpty {
-            out += "participants: [\(speakers.map(yaml).joined(separator: ", "))]\n"
+            out += "participants:\(list(speakers.map(person)))\n"
         }
         if let p = platformName(c?.platform) { out += "platform: \(yaml(p))\n" }
         if let code = c?.meetingCode { out += "meeting_code: \(yaml(code))\n" }
@@ -103,15 +108,65 @@ enum Formats {
         if !notes.isEmpty {
             out += "## Notes\n\n" + notes.map { "- **\(clock($0.time))** \($0.kind == "bookmark" ? "🔖 " : "")\($0.text)" }.joined(separator: "\n") + "\n\n"
         }
+        let found = links(c)
+        if !found.isEmpty {
+            out += "## Links\n\n" + found.map { l in
+                let label = l.url.scheme == "mailto" ? "[\(l.label)](\(l.url.absoluteString))" : "<\(l.url.absoluteString)>"
+                return "- \(label)\(l.who.map { " — \(person($0))" } ?? ""), \(clock(l.t))"
+            }.joined(separator: "\n") + "\n\n"
+        }
         out += "## Transcript\n\n"
         let chat = chats(c)
         var blocks: [(Double, String)] = paragraphs(t.segments, breaks: chat.map(\.t)).map { p in
-            (t.segments[p[0]].start, "**\(clock(t.segments[p[0]].start))**\(t.segments[p[0]].speaker.map { " **\($0):**" } ?? "") "
+            (t.segments[p[0]].start, "**\(clock(t.segments[p[0]].start))**\(t.segments[p[0]].speaker.map { " **\(person($0)):**" } ?? "") "
                 + p.map { t.segments[$0].text }.joined(separator: " "))
         }
-        blocks += chat.map { e in (e.t, "> **\(clock(e.t))** 💬 \(e.who.map { "**\($0):** " } ?? "")\(e.text ?? "")") }
+        blocks += chat.map { e in (e.t, "> **\(clock(e.t))** 💬 \(e.who.map { "**\(person($0)):** " } ?? "")\(e.text ?? "")") }
         out += blocks.enumerated().sorted { ($0.element.0, $0.offset) < ($1.element.0, $1.offset) }.map(\.element.1).joined(separator: "\n\n")
         return out + "\n"
+    }
+
+    /// "[[Name]]", without the characters that end or split a wikilink.
+    static func wikilink(_ name: String) -> String {
+        "[[" + name.filter { !"[]|#^".contains($0) }.trimmingCharacters(in: .whitespaces) + "]]"
+    }
+
+    /// Real names only: not "Speaker 2", the shared participants label or "Unknown".
+    static func linkable(_ name: String) -> Bool {
+        let n = name.trimmingCharacters(in: .whitespaces)
+        return !n.isEmpty && !SpeakerPicker.isUnnamed(n) && n != Settings.participantsName && n != "Unknown"
+    }
+
+    struct Link: Hashable {
+        var url: URL
+        /// The text as written in the chat (the address for an email).
+        var label: String
+        var who: String?
+        var t: Double
+    }
+
+    /// Web links and email addresses sent in a meeting's chat, first mention only, in time order.
+    private static let linkDetector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
+
+    static func links(_ c: MeetingContext?) -> [Link] {
+        guard let detector = linkDetector else { return [] }
+        var seen = Set<String>(), out: [Link] = []
+        for e in chats(c) {
+            let text = e.text ?? ""
+            for m in detector.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
+                guard var url = m.url, let r = Range(m.range, in: text) else { continue }
+                var label = String(text[r])
+                if url.scheme == "mailto" {
+                    label = label.replacingOccurrences(of: "mailto:", with: "", options: [.caseInsensitive, .anchored])
+                } else if url.scheme == nil || !["http", "https"].contains(url.scheme!.lowercased()) {
+                    guard url.scheme == nil, let web = URL(string: "https://" + label) else { continue }
+                    url = web
+                }
+                guard seen.insert(url.absoluteString.lowercased()).inserted else { continue }
+                out.append(Link(url: url, label: label, who: e.who, t: e.t))
+            }
+        }
+        return out
     }
 
     /// Chat messages of a meeting, in time order.
@@ -145,6 +200,13 @@ enum Formats {
     static func clock(_ seconds: Double) -> String {
         let s = Int(seconds.rounded())
         return s >= 3600 ? String(format: "%d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60) : String(format: "%d:%02d", s / 60, s % 60)
+    }
+
+    /// A list item; `series` (meeting id → series key, from `Series.index`) adds `series_id`.
+    static func summary(_ t: Transcript, series: [String: String]) -> [String: Any] {
+        var d = summary(t)
+        d["series_id"] = series[t.id]
+        return d
     }
 
     static func summary(_ t: Transcript) -> [String: Any] {

@@ -1,7 +1,14 @@
 .build/
 .swiftpm/
 dist/
-.signing.env
 private/
 .DS_Store
 *.xcodeproj/xcuserdata/
+# Secrets: signing identity, keychains, exported keys (the Sparkle EdDSA key stays in the login keychain)
+.signing.env
+*.env
+*.p12
+*.pem
+*.key
+*.keychain-db
+sparkle_private_key*

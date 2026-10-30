@@ -10,23 +10,15 @@ final class TranscriptPlayer {
     var duration: Double = 0
     var playing = false
     var rate: Float = 1
+    /// The voice whose clip is playing ("Who is this?"); playback pauses at `clipEnd`.
+    private(set) var clipLabel: String?
+    private var clipEnd: Double?
     private var observer: Any?
     private var stopped = false
 
     func load(_ t: Transcript) {
         stopped = false
-        var urls: [URL] = []
-        if let p = t.sourcePath {
-            var isDir: ObjCBool = false
-            if FileManager.default.fileExists(atPath: p, isDirectory: &isDir) {
-                if isDir.boolValue {
-                    urls = ["others.wav", "me.wav"].map { URL(fileURLWithPath: p).appendingPathComponent($0) }
-                        .filter { FileManager.default.fileExists(atPath: $0.path) }
-                } else {
-                    urls = [URL(fileURLWithPath: p)]
-                }
-            }
-        }
+        let urls = AudioRetention.tracks(t)
         guard !urls.isEmpty else { return }
         Task {
             let composition = AVMutableComposition()
@@ -43,8 +35,10 @@ final class TranscriptPlayer {
             duration = composition.duration.seconds.isFinite ? composition.duration.seconds : (t.duration ?? 0)
             observer = p.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.1, preferredTimescale: 600), queue: .main) { [weak self] cm in
                 MainActor.assumeIsolated {
-                    self?.time = cm.seconds
-                    self?.playing = (self?.player?.rate ?? 0) > 0
+                    guard let self else { return }
+                    self.time = cm.seconds
+                    if let end = self.clipEnd, cm.seconds >= end { self.stopClip() }
+                    self.playing = (self.player?.rate ?? 0) > 0
                 }
             }
             player = p
@@ -53,8 +47,27 @@ final class TranscriptPlayer {
 
     func toggle() {
         guard let player else { return }
+        clipEnd = nil
+        clipLabel = nil
         if player.rate > 0 { player.pause() } else { player.playImmediately(atRate: rate) }
         playing = player.rate > 0
+    }
+
+    /// Plays `from`…`to` once, then pauses.
+    func play(from start: Double, to end: Double, label: String) {
+        guard let player else { return }
+        seek(start)
+        clipEnd = end
+        clipLabel = label
+        player.playImmediately(atRate: rate)
+        playing = true
+    }
+
+    func stopClip() {
+        player?.pause()
+        clipEnd = nil
+        clipLabel = nil
+        playing = false
     }
 
     func seek(_ s: Double) {
@@ -86,6 +99,9 @@ struct TranscriptDetail: View {
     @State private var favoritesOnly = false
     @State private var fontSize = Settings.fontSize
     @State private var layout = TranscriptLayout.empty
+    @State private var audio = AudioRetention.Audio.none
+    /// "Who is this?" prompts, recomputed when the transcript or the skipped voices change (not on every search keystroke).
+    @State private var prompts: [SpeakerPicker.Prompt] = []
 
     var body: some View {
         HStack(spacing: 10) {
@@ -105,6 +121,9 @@ struct TranscriptDetail: View {
                                         .font(.callout).padding(12).frame(maxWidth: .infinity, alignment: .leading).glassCard(14)
                                 }
                                 if let notes = transcript.notes, !notes.isEmpty { NotesCard(notes: notes) { player.seek($0) } }
+                                if transcript.origin == "meeting", !state.polishing.contains(transcript.id), !prompts.isEmpty {
+                                    SpeakerPromptCard(transcript: transcript, prompts: prompts, player: player)
+                                }
                                 Playhead(transcript: transcript, layout: layout, mode: mode, fontSize: fontSize, player: player, proxy: proxy)
                             }
                             .padding(.horizontal, 36).padding(.top, 18).padding(.bottom, 120)
@@ -114,18 +133,36 @@ struct TranscriptDetail: View {
                         }
                     }
                 }
-                PlaybackBar(player: player).padding(16)
+                switch audio {
+                case .deleted:
+                    Label(AudioRetention.deletedNote, systemImage: "waveform.slash")
+                        .font(.callout).foregroundStyle(.secondary)
+                        .padding(.horizontal, 16).padding(.vertical, 10).glassCapsule().padding(16)
+                        .help("The transcript is kept; the audio was removed to save space (Settings → Storage)")
+                case .present, .none: PlaybackBar(player: player).padding(16)
+                }
             }
             .panel()
 
             if inspector {
                 Inspector(transcript: transcript, mode: $mode, tab: $inspectorTab, favoritesOnly: $favoritesOnly, fontSize: $fontSize,
-                          seek: { player.seek($0) })
+                          hasAudio: audio == .present, seek: { player.seek($0) })
                     .frame(width: 320)
                     .panel()
             }
         }
-        .onAppear { player.load(transcript) }
+        .onAppear {
+            audio = AudioRetention.audio(transcript)
+            player.load(transcript)
+        }
+        // Retention or a delete may have removed the recording since.
+        .onChange(of: AudioKey(id: transcript.id, source: transcript.sourcePath, library: state.libraryVersion)) {
+            audio = AudioRetention.audio(transcript)
+        }
+        .onChange(of: PromptKey(segments: transcript.segments, context: transcript.context, skipped: state.skippedSpeakers[transcript.id] ?? []),
+                  initial: true) { _, key in
+            prompts = transcript.origin == "meeting" ? SpeakerPicker.prompts(segments: key.segments, context: key.context, skipped: key.skipped) : []
+        }
         .onDisappear { player.stop() }
         .onChange(of: fontSize) { Settings.fontSize = fontSize }
         .onChange(of: LayoutKey(segments: transcript.segments, chats: Formats.chats(transcript.context), favoritesOnly: favoritesOnly,
@@ -133,6 +170,18 @@ struct TranscriptDetail: View {
             layout = TranscriptLayout(key)
         }
     }
+}
+
+private struct AudioKey: Equatable {
+    let id: String
+    let source: String?
+    let library: Int
+}
+
+private struct PromptKey: Equatable {
+    let segments: [Segment]
+    let context: MeetingContext?
+    let skipped: Set<String>
 }
 
 private struct LayoutKey: Equatable {
@@ -283,7 +332,8 @@ private struct SegmentList: View, Equatable {
     }
 
     var body: some View {
-        Group { if mode == "editor" { editor } else { segments } }
+        let roster = SpeakerPicker.unassigned(segments: transcript.segments, context: transcript.context)
+        Group { if mode == "editor" { editor(roster) } else { segments } }
             .environment(\.openURL, OpenURLAction { url in
                 guard url.scheme == Self.seekScheme, let i = Int(url.absoluteString.dropFirst(Self.seekScheme.count + 1)),
                       transcript.segments.indices.contains(i) else { return .systemAction }
@@ -311,7 +361,7 @@ private struct SegmentList: View, Equatable {
     }
 
     /// Editor: paragraphs per speaker turn with a speaker chip and timestamp.
-    private var editor: some View {
+    private func editor(_ roster: [String]) -> some View {
         LazyVStack(alignment: .leading, spacing: 22) {
             ForEach(layout.blocks) { block in
                 if let chat = block.chat {
@@ -320,7 +370,7 @@ private struct SegmentList: View, Equatable {
                     let first = block.items[0].1
                     VStack(alignment: .leading, spacing: 6) {
                         HStack(spacing: 8) {
-                            SpeakerChip(transcript: transcript, speaker: first.speaker)
+                            SpeakerChip(transcript: transcript, speaker: first.speaker, roster: roster)
                             Button { seek(first.start) } label: {
                                 Text(Fmt.clock(first.start)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                             }
@@ -453,12 +503,21 @@ private struct SpeakerChip: View {
     @Environment(AppState.self) private var state
     let transcript: Transcript
     let speaker: String?
+    /// People in the meeting no speaker is named after yet.
+    var roster: [String] = []
     @State private var renaming = false
     @State private var name = ""
 
     var body: some View {
+        let inMeeting = Set(roster.map(SpeakerPicker.key))
         Menu {
-            ForEach(state.people) { p in
+            if !roster.isEmpty {
+                Section("In this meeting") {
+                    ForEach(roster, id: \.self) { n in Button(n) { state.nameSpeaker(in: transcript, from: speaker, to: n) } }
+                }
+                Divider()
+            }
+            ForEach(state.people.filter { !inMeeting.contains(SpeakerPicker.key($0.name)) && $0.name != speaker }) { p in
                 Button(p.name) { state.renameSpeaker(in: transcript, from: speaker, to: p.name) }
             }
             if !state.people.isEmpty { Divider() }
@@ -494,6 +553,7 @@ private struct Inspector: View {
     @Binding var tab: String
     @Binding var favoritesOnly: Bool
     @Binding var fontSize: Double
+    var hasAudio = true
     let seek: (Double) -> Void
     @State private var newSpeaker = ""
 
@@ -576,13 +636,15 @@ private struct Inspector: View {
         }
         .padding(12).glassCard(14)
 
-        if transcript.origin == "meeting" {
+        // Not offered without a recording: it would only fail.
+        if transcript.origin == "meeting", hasAudio || state.polishing.contains(transcript.id) {
             let busy = state.polishing.contains(transcript.id)
             Button { state.retranscribe(transcript) } label: {
                 Label(busy ? "Re-transcribing…" : "Re-transcribe Meeting", systemImage: "arrow.triangle.2.circlepath")
                     .frame(maxWidth: .infinity).frame(height: 36)
             }
-            .buttonStyle(.plain).glassCard(12, interactive: true).disabled(busy)
+            .buttonStyle(.plain).glassCard(12, interactive: true).disabled(busy || !hasAudio)
+            .help(hasAudio ? "Transcribe both recordings again" : AudioRetention.deletedNote)
         }
         Menu {
             ForEach(state.folders) { f in Button(f.name) { state.move(transcript.id, to: f.id) } }

@@ -20,6 +20,15 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN/Earshot" "$APP/Contents/MacOS/Earshot"
 cp "$BIN/earshot-mcp" "$APP/Contents/MacOS/earshot-mcp"
 cp Info.plist "$APP/Contents/Info.plist"
+# Sparkle (auto-update). ditto keeps the framework's Versions/ symlinks. Earshot isn't sandboxed, so the installer
+# and downloader XPC services go unused (Sparkle's docs allow removing them); headers aren't needed at run time.
+mkdir -p "$APP/Contents/Frameworks"
+ditto "$BIN/Sparkle.framework" "$APP/Contents/Frameworks/Sparkle.framework"
+for d in XPCServices Headers PrivateHeaders Modules; do
+  rm -rf "$APP/Contents/Frameworks/Sparkle.framework/$d" "$APP/Contents/Frameworks/Sparkle.framework/Versions/B/$d"
+done
+# SwiftPM links with @loader_path only; the bundled app loads Sparkle from Contents/Frameworks. Signed below.
+install_name_tool -add_rpath @executable_path/../Frameworks "$APP/Contents/MacOS/Earshot" 2>/dev/null
 # App icon: Resources/AppIcon.png (1024×1024, full bleed: macOS applies its own mask) → AppIcon.icns, the fallback
 if [[ -f Resources/AppIcon.png ]]; then
   SET=$(mktemp -d)/AppIcon.iconset

@@ -7,7 +7,7 @@ struct SettingsWindow: View {
 
     static let groups: [(String, [(String, String)])] = [
         ("GENERAL", [("General", "gearshape"), ("Appearance", "paintpalette"), ("Watched Folders", "folder.badge.gearshape"),
-                     ("Shortcuts", "command"), ("Advanced", "slider.horizontal.3")]),
+                     ("Shortcuts", "command"), ("Storage", "internaldrive"), ("Advanced", "slider.horizontal.3")]),
         ("AUDIO & VIDEO", [("Microphone", "mic"), ("Live Captions", "captions.bubble"), ("Dictation", "character.cursor.ibeam"),
                            ("Record Meetings", "person.2.wave.2"), ("Note Taker", "bookmark")]),
         ("TRANSCRIPTION", [("Local Models", "cpu"), ("Cloud Models", "cloud"), ("People", "person.2"), ("Custom Vocabulary", "textformat.abc"), ("Translation", "character.book.closed"),
@@ -196,6 +196,8 @@ private struct SettingsPage: View {
                     Text("earshot://\($0)").font(.system(.body, design: .monospaced)).textSelection(.enabled)
                 }
             }
+        case "Storage":
+            StorageSettings()
         case "Advanced":
             GlassGroup {
                 LabeledContent("Data folder") { Text(Paths.support.path).textSelection(.enabled).font(.caption) }
@@ -308,6 +310,26 @@ private struct SettingsPage: View {
                 }
                 note("Every finished transcript is also written to this folder in the selected formats.")
             }
+            GlassGroup(title: "Obsidian") {
+                toggle("Link people for Obsidian", Settings.obsidianLinks) { Settings.obsidianLinks = $0 }
+                note("Markdown writes participants and speakers as [[Name]], in the front matter and in front of each paragraph, so every person gets a page of their meetings.")
+                LabeledContent("Add meetings to the daily note") {
+                    HStack {
+                        Text(Settings.obsidianDailyNote ?? "Off").lineLimit(1).truncationMode(.middle).foregroundStyle(.secondary)
+                        Button("Choose…") {
+                            let panel = NSOpenPanel()
+                            panel.canChooseDirectories = true
+                            panel.canChooseFiles = false
+                            panel.canCreateDirectories = true
+                            panel.message = "Choose the folder with your daily notes (YYYY-MM-DD.md)"
+                            if panel.runModal() == .OK { Settings.obsidianDailyNote = panel.url?.path; tick += 1 }
+                        }
+                        .buttonStyle(.glass)
+                        if Settings.obsidianDailyNote != nil { Button("Off") { Settings.obsidianDailyNote = nil; tick += 1 }.buttonStyle(.glass) }
+                    }
+                }
+                note("After Auto-Export, each meeting is added to that day's note as “- [[file]] 14:30 Title (participants)”. Lines are only ever appended; the note is created if it doesn't exist.")
+            }
             GlassGroup {
                 toggle("Start TXT files with the title, date and participants", Settings.txtHeader) { Settings.txtHeader = $0 }
                 note("Text and Markdown keep each speaker's turn in one paragraph; a new one starts when the speaker changes, after a pause of more than 10 seconds, or after about two minutes.")
@@ -345,6 +367,8 @@ private struct SettingsPage: View {
                 note("On-device meeting and audio transcription for macOS, with a local API for your other apps. Engines: FluidAudio (Parakeet v3, pyannote, LocalVQE) and WhisperKit (Whisper large-v3-turbo).")
                 Button("Open README") { state.openSupport() }.buttonStyle(.glass)
             }
+            UpdaterSettingsView()
+            DiagnosticsSettings()
         }
     }
 
@@ -389,6 +413,8 @@ private struct MeetingSettings: View {
                 Text("Do nothing").tag("off")
             }
             row("Stop recording 10 seconds after a meeting ends. Dismiss the alert to keep recording.", Settings.autoStopAfterMeeting) { Settings.autoStopAfterMeeting = $0 }
+            row("Show options before joining a Meet call", Settings.preJoinOverlay) { Settings.preJoinOverlay = $0 }
+            explain("On Google Meet's “Ready to join?” screen, pick the language and whether to record, show Live Captions or do nothing. Earshot remembers the choice for that meeting and its series. Needs Accessibility access.")
             row("Automatically dismiss detected meeting alerts after 10 seconds", Settings.autoDismissMeetingAlerts) { Settings.autoDismissMeetingAlerts = $0 }
             row("Speaker detection (Speaker 1, 2, … for the other participants)", Settings.diarizeMeetings) { Settings.diarizeMeetings = $0 }
             row("Smart meeting titles from your calendar", Settings.useCalendarTitles) { Settings.useCalendarTitles = $0 }
@@ -404,6 +430,14 @@ private struct MeetingSettings: View {
             explain("While you're muted in the meeting app, silence is recorded instead of your microphone, so side conversations stay out of the transcript.")
             row("Save Live Captions of calls as meetings", Settings.keepLiveCaptionsOfCalls) { Settings.keepLiveCaptionsOfCalls = $0 }
             explain("Live Captions started during a call are saved to Meetings when they stop. Other Live Captions are never saved unless you click Save as meeting.")
+            row("Turn on Meet captions automatically", Settings.autoEnableCaptions) { Settings.autoEnableCaptions = $0 }
+            explain("Switches on Meet's captions (CC) when you join. They show only on your screen and let Earshot name who is speaking.")
+            row("Warn when Meet can't be read", Settings.meetHealthWarnings) { Settings.meetHealthWarnings = $0 }
+            explain("A note in the live panel when captions are off or Meet's page can't be read, so speaker names don't go missing silently.")
+            row("Use names and agenda words as transcription hints", Settings.roomVocabulary) { Settings.roomVocabulary = $0 }
+            explain("Participant names, the calendar event and chat words help the speech model spell them right in this meeting.")
+            row("Fix name spellings from Meet captions", Settings.captionSpelling) { Settings.captionSpelling = $0 }
+            explain("Where a word is uncertain, the spelling Meet's captions used for a name or term at that moment is taken instead.")
         }
         GlassGroup(title: "Apps to observe") {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 180))], alignment: .leading, spacing: 8) {
@@ -660,5 +694,112 @@ private struct WebhookSettings: View {
         urls.append(u)
         newURL = ""
         Settings.webhooks = urls
+    }
+}
+
+/// Settings → Storage: compression, how long recordings are kept, and what they use on disk.
+private struct StorageSettings: View {
+    @State private var tick = 0
+    @State private var used: Int64?
+    @State private var olderThan = 30
+    @State private var confirm = false
+    @State private var working = false
+    @State private var result: String?
+    /// A shorter "Keep recordings for" that would delete recordings right away: asked first.
+    @State private var shorter: Shorter?
+
+    private struct Shorter: Equatable { var days: Int; var count: Int; var bytes: Int64 }
+
+    var body: some View {
+        let _ = tick
+        GlassGroup(title: "Recordings") {
+            SwitchRow(title: "Compress recordings after the transcript is done",
+                      isOn: Binding(get: { Settings.compressRecordings }, set: { Settings.compressRecordings = $0; tick += 1 }))
+            Text("Meeting audio is stored as AAC (.m4a) once the final transcript is saved, a fraction of the size. Playback and Re-transcribe still work.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true).padding(.top, -8)
+            Picker("Keep recordings for", selection: Binding(get: { Settings.keepAudioDays }, set: { days in
+                guard days > 0 else { Settings.keepAudioDays = days; tick += 1; return }
+                Task {
+                    let (count, bytes) = await AudioRetention.preview(olderThan: days)
+                    if count == 0 { Settings.keepAudioDays = days; tick += 1 } else { shorter = Shorter(days: days, count: count, bytes: bytes) }
+                }
+            })) {
+                ForEach(AudioRetention.choices, id: \.self) { Text(AudioRetention.label($0)).tag($0) }
+            }
+            Text("Older recordings are deleted once a day; transcripts, notes and speakers stay. Transcripts with a favourite line keep their audio.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true).padding(.top, -8)
+        }
+        GlassGroup(title: "Disk use") {
+            LabeledContent("Recordings") {
+                Text(used.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? "Measuring…").monospacedDigit()
+            }
+            HStack {
+                Picker("Delete all recordings older than", selection: $olderThan) {
+                    ForEach(AudioRetention.choices.dropFirst(), id: \.self) { Text(AudioRetention.label($0)).tag($0) }
+                }
+                .fixedSize()
+                Button("Delete…") { confirm = true }.buttonStyle(.glass).disabled(working)
+                Spacer()
+                Button("Show in Finder") { NSWorkspace.shared.open(Paths.meetings) }.buttonStyle(.glass)
+            }
+            if let result { Text(result).font(.callout).foregroundStyle(.secondary) }
+        }
+        .confirmationDialog("Delete all recordings older than \(AudioRetention.label(olderThan))?", isPresented: $confirm) {
+            Button("Delete Recordings", role: .destructive) {
+                working = true
+                Task {
+                    let (count, bytes) = await AudioRetention.run(olderThan: olderThan)
+                    result = count == 0 ? "Nothing to delete." : "Deleted \(count) recording\(count == 1 ? "" : "s"), \(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)) freed."
+                    working = false
+                    await measure()
+                }
+            }
+        } message: {
+            Text("Transcripts are kept, and transcripts with a favourite line keep their audio. Deleted recordings can't be played or re-transcribed.")
+        }
+        .confirmationDialog(shorter.map { "Delete \($0.count) recording\($0.count == 1 ? "" : "s") now?" } ?? "",
+                            isPresented: Binding(get: { shorter != nil }, set: { if !$0 { shorter = nil; tick += 1 } }), presenting: shorter) { s in
+            Button("Keep for \(AudioRetention.label(s.days)) and Delete", role: .destructive) {
+                Settings.keepAudioDays = s.days
+                tick += 1
+                working = true
+                Task {
+                    let (count, bytes) = await AudioRetention.run(olderThan: s.days)
+                    result = count == 0 ? "Nothing to delete." : "Deleted \(count) recording\(count == 1 ? "" : "s"), \(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)) freed."
+                    working = false
+                    await measure()
+                }
+            }
+        } message: { s in
+            Text("\(s.count) recording\(s.count == 1 ? " is" : "s are") older than \(AudioRetention.label(s.days)) (\(ByteCountFormatter.string(fromByteCount: s.bytes, countStyle: .file))) and will be deleted now. Transcripts are kept. Deleted recordings can't be played or re-transcribed.")
+        }
+        .task { await measure() }
+    }
+
+    private func measure() async {
+        used = await Task.detached(priority: .utility) { AudioRetention.diskUse() }.value
+    }
+}
+
+/// Settings → About: a plain-text report for bug reports (no token, no transcript text).
+private struct DiagnosticsSettings: View {
+    @State private var copied = false
+
+    var body: some View {
+        GlassGroup(title: "Diagnostics") {
+            Text("Copies your Mac, audio devices, permissions, models, the key settings, the last meeting's warnings and the end of the debug log. Names, titles, meeting codes, transcript and chat text, device names and the API token are never included.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Button("Copy Diagnostics") {
+                    Task {
+                        let report = await Diagnostics.report()
+                        AppState.shared.copy(report)
+                        copied = true
+                    }
+                }
+                .buttonStyle(.glass)
+                if copied { Label("Copied", systemImage: "checkmark").font(.callout).foregroundStyle(.green) }
+            }
+        }
     }
 }

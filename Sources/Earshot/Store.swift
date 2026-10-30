@@ -12,6 +12,11 @@ final class Store: @unchecked Sendable {
     private let lock = NSLock()
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+    /// Bumped by every write, so what is computed from the library can be cached until it changes.
+    private var changes = 0
+    private var seriesCache: (changes: Int, index: Series.Index)?
+
+    var generation: Int { lock.withLock { changes } }
 
     private init() {
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
@@ -311,6 +316,54 @@ final class Store: @unchecked Sendable {
         }
     }
 
+    // MARK: Meetings across the library
+
+    /// Every active meeting with only what groups it into series: id, date, title and its calendar event's series id
+    /// and title (not the whole context with its captions and events).
+    func meetingHeaders() -> [Transcript] {
+        query("""
+        SELECT id, created, title, CASE WHEN json_valid(context) THEN json_extract(context, '$.calendar.seriesID') END,
+               CASE WHEN json_valid(context) THEN json_extract(context, '$.calendar.title') END
+        FROM transcripts WHERE deleted IS NULL AND origin = 'meeting' ORDER BY created DESC
+        """, []) { st in
+            let series = self.text(st, 3), calendar = self.text(st, 4)
+            var context: MeetingContext?
+            if series != nil || calendar != nil {
+                context = MeetingContext()
+                context?.calendar = CalendarInfo(title: calendar, seriesID: series)
+            }
+            return Transcript(id: self.text(st, 0) ?? "", createdAt: Date(timeIntervalSince1970: sqlite3_column_double(st, 1)), title: self.text(st, 2) ?? "",
+                              sourcePath: nil, origin: "meeting", model: "", language: nil, duration: nil, processingSeconds: 0, text: "", segments: [],
+                              context: context)
+        }
+    }
+
+    /// The library's series, rebuilt only after a write.
+    func seriesIndex() -> Series.Index {
+        let (cached, now) = lock.withLock { (seriesCache?.changes == changes ? seriesCache?.index : nil, changes) }
+        if let cached { return cached }
+        let index = Series.build(meetingHeaders())
+        lock.withLock { if changes == now { seriesCache = (now, index) } }
+        return index
+    }
+
+    /// Transcripts with at least one speaker label, newest first, for the speaker routes.
+    func withSpeakers(since: Date? = nil, origin: String? = nil) -> [Transcript] {
+        var sql = "SELECT \(Self.columns) FROM transcripts WHERE deleted IS NULL AND segments LIKE '%\"speaker\":%'"
+        var args: [String?] = []
+        if let since { sql += " AND created >= \(since.timeIntervalSince1970)" }
+        if let origin { sql += " AND origin = ?"; args.append(origin) }
+        return query(sql + " ORDER BY created DESC", args) { self.row($0) }
+    }
+
+    /// Recordings whose oldest transcript is older than `cutoff` and that no transcript with a favourite line points at.
+    func recordingsOlder(than cutoff: Date) -> [(path: String, ids: [String])] {
+        query("""
+        SELECT source_path, GROUP_CONCAT(id) FROM transcripts WHERE source_path IS NOT NULL GROUP BY source_path
+        HAVING MIN(created) < \(cutoff.timeIntervalSince1970) AND SUM(segments LIKE '%"favorite":true%') = 0
+        """, []) { st in self.text(st, 0).map { ($0, (self.text(st, 1) ?? "").split(separator: ",").map(String.init)) } }.compactMap { $0 }
+    }
+
     // MARK: Folders
 
     func folders() -> [Folder] {
@@ -391,6 +444,7 @@ final class Store: @unchecked Sendable {
 
     @discardableResult
     private func step(_ st: OpaquePointer?) -> Bool {
+        if sqlite3_stmt_readonly(st) == 0 { changes += 1 }
         let rc = sqlite3_step(st)
         if rc != SQLITE_DONE && rc != SQLITE_ROW { NSLog("Earshot: SQLite step failed (\(rc)): \(db.map { String(cString: sqlite3_errmsg($0)) } ?? "")") }
         return rc == SQLITE_DONE || rc == SQLITE_ROW

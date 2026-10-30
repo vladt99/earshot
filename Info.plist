@@ -9,8 +9,8 @@
 	<key>CFBundleIconFile</key><string>AppIcon</string>
 	<key>CFBundleIconName</key><string>AppIcon</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
-	<key>CFBundleShortVersionString</key><string>0.10.0</string>
-	<key>CFBundleVersion</key><string>11</string>
+	<key>CFBundleShortVersionString</key><string>0.12.0</string>
+	<key>CFBundleVersion</key><string>13</string>
 	<key>LSMinimumSystemVersion</key><string>26.0</string>
 	<key>LSUIElement</key><false/>
 	<key>LSMultipleInstancesProhibited</key><true/>
@@ -21,6 +21,8 @@
 		<key>CFBundleURLName</key><string>io.github.vladt99.Earshot</string>
 		<key>CFBundleURLSchemes</key><array><string>earshot</string></array>
 	</dict></array>
+	<key>SUFeedURL</key><string>https://raw.githubusercontent.com/vladt99/earshot/main/appcast.xml</string>
+	<key>SUPublicEDKey</key><string>DuqJ9FnDEsTEBujmvZCOzs+U39NCtAH/k1geXk+es7w=</string>
 	<key>NSMicrophoneUsageDescription</key><string>Earshot records your microphone to transcribe dictation locally.</string>
 </dict>
 </plist>

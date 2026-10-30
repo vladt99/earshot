@@ -7,7 +7,7 @@ import Foundation
 //   claude mcp add earshot -- /Applications/Earshot.app/Contents/MacOS/earshot-mcp
 
 let supportedVersions = ["2025-06-18", "2025-03-26", "2024-11-05"]
-let serverVersion = "0.10.0"
+let serverVersion = "0.12.0"
 
 struct Tool {
     let name: String
@@ -87,13 +87,33 @@ let tools: [Tool] = [
         return pretty(try await request("GET", "v1/search", query: q))
     },
     Tool(name: "list_meetings",
-         description: "Most recent recorded meetings: id, title, date, duration, preview, participants, platform, meeting code and link.",
-         properties: ["limit": ["type": "integer", "description": "How many (default 20)"]],
+         description: "Most recent recorded meetings: id, title, date, duration, preview, participants, platform, meeting code and link, and series_id for recurring meetings. Pass series (a series_id, or a meeting title) to list every meeting of one recurring series.",
+         properties: ["limit": ["type": "integer", "description": "How many (default 20)"],
+                      "series": ["type": "string", "description": "A series_id from this list, or a title such as \"Weekly sync\""]],
          required: []) { a in
-        pretty(try await request("GET", "v1/meetings", query: ["limit": "\((a["limit"] as? Int) ?? 20)"]))
+        var q = ["limit": "\((a["limit"] as? Int) ?? 20)"]
+        q["series"] = string(a, "series")
+        return pretty(try await request("GET", "v1/meetings", query: q))
+    },
+    Tool(name: "speaker_lines",
+         description: "What one person said across all meetings, newest first: meeting id, title, date, start and end (seconds into the meeting) and text. The name matches case- and accent-insensitively and through meeting participants (a first name or email finds their lines). Use list_speakers for the names Earshot knows.",
+         properties: ["name": ["type": "string", "description": "Person's name as in transcripts, a first name, or an email"],
+                      "query": ["type": "string", "description": "Only lines containing all of these words"],
+                      "since": ["type": "string", "description": "Only meetings on or after this date (YYYY-MM-DD)"],
+                      "limit": ["type": "integer", "description": "Max lines (default 50)"]],
+         required: ["name"]) { a in
+        var q = ["limit": "\((a["limit"] as? Int) ?? 50)"]
+        q["q"] = string(a, "query")
+        q["since"] = string(a, "since")
+        return pretty(try await request("GET", "v1/speakers/" + segment(string(a, "name") ?? "") + "/lines", query: q))
+    },
+    Tool(name: "list_speakers",
+         description: "Every named speaker in the library with how many meetings they spoke in, their number of lines and when they were last heard. Unnamed labels (Speaker 1, 2, …) are left out.",
+         properties: [:], required: []) { _ in
+        pretty(try await request("GET", "v1/speakers"))
     },
     Tool(name: "get_transcript",
-         description: "One transcript by id. format \"text\" gives a header (title, date, meeting room, calendar event, participants) and speaker paragraphs; \"json\" gives segments with timestamps, speakers, notes and the meeting context (participants with guest/bot flags, room, calendar event, joined/left/chat events).",
+         description: "One transcript by id. format \"text\" gives a header (title, date, meeting room, calendar event, participants) and speaker paragraphs; \"json\" gives segments with timestamps, speakers, notes and the meeting context (participants with guest/bot flags, room, calendar event with its series_id, and a timeline of joins, leaves, chat, reactions, screen sharing and captions on/off).",
          properties: ["id": ["type": "string"], "format": ["type": "string", "enum": ["text", "json"]]],
          required: ["id"]) { a in
         let r = try await request("GET", "v1/transcripts/" + segment(string(a, "id") ?? ""), query: ["format": "verbose_json"])
@@ -202,7 +222,7 @@ func handle(_ msg: [String: Any], method: String) async {
             "protocolVersion": asked.flatMap { supportedVersions.contains($0) ? $0 : nil } ?? supportedVersions[0],
             "capabilities": ["tools": [:]],
             "serverInfo": ["name": "earshot", "version": serverVersion],
-            "instructions": "Meeting transcripts recorded on this Mac by Earshot. Search first, then read a transcript by id.",
+            "instructions": "Meeting transcripts recorded on this Mac by Earshot. Search first, then read a transcript by id. For what one person said, use list_speakers and speaker_lines; for a recurring meeting, list_meetings with series.",
         ]])
     case "ping":
         send(["jsonrpc": "2.0", "id": id, "result": [:]])

@@ -100,6 +100,7 @@ struct LiveMeetingView: View {
                         .font(.caption).padding(8).frame(maxWidth: .infinity, alignment: .leading)
                         .background(.yellow.opacity(0.15), in: RoundedRectangle(cornerRadius: 6))
                 }
+                MeetHints(meeting: m)
                 if m.captionsNeedAccess {
                     HStack {
                         Label("Speaker names need Accessibility access", systemImage: "captions.bubble").font(.caption)
@@ -109,8 +110,20 @@ struct LiveMeetingView: View {
                     .padding(8)
                     .background(.yellow.opacity(0.15), in: RoundedRectangle(cornerRadius: 6))
                 }
+                if !m.stopping, let p = state.livePrompt {
+                    let named = Array(Set(m.lines.compactMap(\.speaker))).filter {
+                        !SpeakerPicker.isUnnamed($0) && $0 != Settings.myName && $0 != Settings.participantsName
+                    }.sorted()
+                    SpeakerPickRow(prompt: p, named: named, pick: { state.nameLiveSpeaker(p.label, $0) }, skip: { state.skipLiveSpeaker(p.label) },
+                                   using: { state.holdLivePrompt($0) })
+                        .id(p.label)
+                        .padding(10).glassCard(14)
+                }
                 transcript(m)
                 if !m.stopping { NoteBar() }
+            } else if let o = state.preJoin, !o.dismissed {
+                PreJoinView(offer: o)
+                Spacer(minLength: 0)
             } else if let d = state.detectedMeeting {
                 VStack(alignment: .leading, spacing: 10) {
                     Label("Meeting detected in \(d.appName)", systemImage: "phone.bubble").font(.headline)
@@ -272,6 +285,41 @@ struct SessionBanner: View {
     }
 }
 
+/// Meet's captions are off (speakers can't be named) and Meet couldn't be read: each shown until closed, once per meeting.
+struct MeetHints: View {
+    @Environment(AppState.self) private var state
+    let meeting: MeetingSnapshot
+    var compact = false
+
+    static let captionsReminder = "Captions are off in Meet — turn them on to name speakers"
+
+    var body: some View {
+        let m = meeting
+        if m.captionsOff, state.showsHint("captions", in: m) {
+            hint(Self.captionsReminder, "captions.bubble", .yellow, id: "captions")
+                .help("Click CC in Meet. Captions show only on your screen; Earshot uses them to put names on speakers.")
+        }
+        if let health = m.meetHealth, state.showsHint(health, in: m) {
+            hint(health, "exclamationmark.triangle.fill", .orange, id: health)
+        }
+    }
+
+    private func hint(_ text: String, _ symbol: String, _ color: Color, id: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Label(text, systemImage: symbol).font(compact ? .callout : .caption).foregroundStyle(compact ? color : .primary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 4)
+            Button { state.dismissHint(id, in: meeting.id) } label: { Image(systemName: "xmark").font(.caption2) }
+                .buttonStyle(.borderless)
+                .help("Dismiss")
+                .accessibilityLabel("Dismiss")
+        }
+        .padding(compact ? 0 : 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(compact ? .clear : color.opacity(0.15), in: RoundedRectangle(cornerRadius: 6))
+    }
+}
+
 /// Type a note (⏎) or drop a bookmark (⌃⌘B works from any app).
 private struct NoteBar: View {
     @State private var text = ""
@@ -291,6 +339,94 @@ private struct NoteBar: View {
                 .buttonStyle(.glass).help("Bookmark this moment (⌃⌘B)")
                 .accessibilityLabel("Bookmark this moment")
         }
+    }
+}
+
+/// "Before you join": the language and what to do when the call starts, picked on Meet's pre-join screen.
+struct PreJoinView: View {
+    @Environment(AppState.self) private var state
+    let offer: PreJoinOffer
+
+    var body: some View {
+        let watcher = PreJoinWatcher.shared
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Label(offer.phase == .asking ? "Waiting to be let in" : "Before you join", systemImage: "door.left.hand.open")
+                        .font(.headline)
+                    Text(offer.title ?? offer.code ?? "Google Meet").font(.subheadline).lineLimit(2)
+                    Text(([Optional("Google Meet"), offer.appName, offer.attendees.map { $0 == 1 ? "1 invited" : "\($0) invited" }] as [String?])
+                        .compactMap { $0 }.joined(separator: " · "))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button { watcher.dismiss() } label: { Image(systemName: "xmark") }
+                    .buttonStyle(.glass).controlSize(.small)
+                    .help(Settings.meetingMode == "auto" ? "Hide (still records when you join)" : "Hide (ask when the call starts)")
+                    .accessibilityLabel("Hide")
+            }
+            .background(WindowDragArea())
+
+            VStack(alignment: .leading, spacing: 10) {
+                LabeledContent("Language") {
+                    Picker("Language", selection: Binding(get: { offer.language }, set: { watcher.setLanguage($0) })) {
+                        Text("Auto (follow Meet's captions)").tag("auto")
+                        Divider()
+                        ForEach(LanguageMenu.languages.dropFirst(), id: \.0) { code, name in Text(name).tag(code) }
+                    }
+                    .labelsHidden().fixedSize()
+                }
+                Label(engineNote, systemImage: "waveform").font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("When you join").font(.caption).foregroundStyle(.secondary)
+                    Picker("When you join", selection: Binding(get: { offer.action }, set: { watcher.setAction($0) })) {
+                        Text("Record").tag("record")
+                        Text("Live Captions").tag("captions")
+                        Text("Don't record").tag("none")
+                    }
+                    .pickerStyle(.segmented).labelsHidden()
+                }
+            }
+            .padding(12).glassCard(14)
+
+            if offer.captionsReminder {
+                Label("Turn on captions in Meet for speaker names", systemImage: "captions.bubble")
+                    .font(.caption).padding(.horizontal, 10).padding(.vertical, 5)
+                    .glassCapsule(tint: .yellow.opacity(0.18))
+                    .help("Meet's captions (CC) tell Earshot who is talking. They're read on this Mac only.")
+            }
+
+            HStack {
+                Text(footer).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Spacer()
+                if Settings.meetingMode == "auto" {
+                    Button("Dismiss") { watcher.dismiss() }.buttonStyle(.glass).controlSize(.small)
+                        .help("Hide this. Earshot still records when you join, as set here.")
+                }
+            }
+        }
+    }
+
+    private var footer: String {
+        let what = ["record": "records", "captions": "shows Live Captions", "none": "stays off"][offer.action] ?? "records"
+        return "Earshot \(what) when you join" + (offer.remembered ? " · remembered from last time" : "") + "."
+    }
+
+    private var engineNote: String {
+        let pinned = offer.language == "auto" ? nil : offer.language
+        let lang = pinned ?? Settings.language
+        guard Engine.usesWhisper(language: lang) else {
+            return pinned == nil && Settings.followMeetingLanguage ? "Parakeet v3 · switches if Meet's captions use another language" : "Parakeet v3"
+        }
+        var note = "Whisper v3 Turbo"
+        if let p = state.downloads[ModelCatalog.whisper.id] {
+            note += " · downloading \(Int(p * 100))%"
+        } else if (state.modelBytes[ModelCatalog.whisper.id] ?? 0) == 0 {
+            note += " · \(ModelCatalog.whisper.sizeText) download, Parakeet covers the start meanwhile"
+        }
+        if pinned == nil, Settings.followMeetingLanguage { note += " · follows Meet's captions" }
+        return note
     }
 }
 

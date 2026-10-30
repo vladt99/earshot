@@ -3,7 +3,7 @@ import UniformTypeIdentifiers
 
 enum Route: Hashable {
     case home, queue, transcriptions, meetings, dictations, deleted
-    case folder(String), person(String), transcript(String)
+    case folder(String), person(String), transcript(String), series(String)
 }
 
 /// Main window: a floating glass sidebar on the left, the selected page on the right, all over the desktop
@@ -46,6 +46,7 @@ struct MainWindow: View {
         case .deleted: "Recently Deleted"
         case .folder(let id): state.folders.first { $0.id == id }?.name ?? "Folder"
         case .person(let name): name
+        case .series(let key): state.seriesGroups[key].map { Series.name($0, in: state.transcripts) } ?? "Series"
         case .transcript: state.currentTranscript?.title ?? "Transcript"
         }
     }
@@ -91,9 +92,12 @@ private struct Page: View {
             LibraryList(items: state.transcripts.filter { !["meeting", "dictation"].contains($0.origin) },
                         empty: ("text.alignleft", "No Transcripts", "Open a file or start a recording to get started.", nil))
         case .meetings:
-            LibraryList(items: state.transcripts.filter { $0.origin == "meeting" },
-                        empty: ("person.2.wave.2", "No Meetings Yet", "Earshot notices when a call starts in Meet, Zoom, Teams and others.",
-                                meetingMode == "off" ? ("Enable Meeting Alerts", { meetingMode = "ask"; state.toast("Meeting alerts enabled") }) : nil))
+            VStack(alignment: .leading, spacing: 8) {
+                if state.search.isEmpty { SeriesStrip() }
+                LibraryList(items: state.transcripts.filter { $0.origin == "meeting" },
+                            empty: ("person.2.wave.2", "No Meetings Yet", "Earshot notices when a call starts in Meet, Zoom, Teams and others.",
+                                    meetingMode == "off" ? ("Enable Meeting Alerts", { meetingMode = "ask"; state.toast("Meeting alerts enabled") }) : nil))
+            }
         case .dictations:
             LibraryList(items: state.transcripts.filter { $0.origin == "dictation" },
                         empty: ("character.cursor.ibeam", "No Dictations Yet", "Text you dictate will appear here.",
@@ -105,7 +109,50 @@ private struct Page: View {
         case .person(let name):
             LibraryList(items: state.transcripts.filter { $0.segments.contains { $0.speaker == name } },
                         empty: ("person", "No Transcripts", "\(name) hasn't been assigned to a speaker yet.", nil))
+        case .series(let key):
+            let ids = Set(state.seriesGroups[key] ?? [])
+            LibraryList(items: state.transcripts.filter { ids.contains($0.id) },
+                        empty: ("repeat", "No Meetings", "This series has no meetings left.", nil))
         case .transcript: EmptyView()
+        }
+    }
+}
+
+/// Meetings page: recurring meetings (two or more of one calendar series or title), newest first.
+private struct SeriesStrip: View {
+    @Environment(AppState.self) private var state
+
+    var body: some View {
+        // Each series' newest meeting, looked up once (not per comparison).
+        let ids = Set(state.seriesGroups.values.compactMap(\.first))
+        let newest = Dictionary(state.transcripts.lazy.filter { ids.contains($0.id) }.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let groups = state.seriesGroups.sorted { a, b in
+            (a.value.first.flatMap { newest[$0]?.createdAt } ?? .distantPast) > (b.value.first.flatMap { newest[$0]?.createdAt } ?? .distantPast)
+        }
+        if !groups.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                SectionTitle(title: "Series", detail: "\(groups.count)")
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 8, alignment: .top)], spacing: 8) {
+                    ForEach(groups, id: \.key) { key, ids in
+                        let latest = ids.first.flatMap { newest[$0] }
+                        Button { state.navigate(.series(key)) } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName: "repeat").foregroundStyle(.tint).frame(width: 28, height: 28)
+                                    .background(.fill.quaternary, in: ConcentricRectangle(corners: .concentric(minimum: 8), isUniform: true))
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(latest.map { $0.context?.calendar?.title ?? $0.title } ?? "Series").font(.headline).lineLimit(1)
+                                    Text("\(ids.count) meetings" + (latest.map { " · last " + $0.createdAt.formatted(date: .abbreviated, time: .omitted) } ?? ""))
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .card(padding: 10, interactive: true)
+                    }
+                }
+            }
         }
     }
 }

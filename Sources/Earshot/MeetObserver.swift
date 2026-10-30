@@ -30,6 +30,21 @@ enum MeetStrings {
     static let endButtons: [Set<String>] = [["Rejoin", "Return to home screen"], ["Reintrați", "Reveniți la ecranul de pornire"],
                                             ["Reintră", "Revino la ecranul de pornire"]]
 
+    // Pre-join screen (the "green room"). English from Meet's UI; every Romanian string here is an unverified guess.
+    static let preJoinTitles: Set<String> = ["Ready to join?", "Ask to join", "Sunteți gata să vă alăturați?", "Ești gata să te alături?",
+                                             "Sunteți gata să participați?", "Ești gata să participi?"]
+    static let joinButtons: Set<String> = ["Join now", "Ask to join", "Join here too", "Switch here", "Participați acum", "Participă acum",
+                                           "Solicitați participarea", "Solicită participarea", "Alăturați-vă acum", "Alătură-te acum",
+                                           "Participați și aici", "Comutați aici"]
+    static let otherWaysToJoin: Set<String> = ["Other ways to join", "Alte modalități de participare", "Alte moduri de a participa",
+                                               "Alte opțiuni de participare"]
+    /// After "Ask to join": waiting for someone to let you in.
+    static let asking: Set<String> = ["Asking to join…", "You'll join the call when someone lets you in", "Se solicită participarea…",
+                                      "Solicitați participarea…", "Veți participa la apel când cineva vă permite accesul",
+                                      "Vei participa la apel când cineva îți permite accesul"]
+    /// Only the call itself has this button.
+    static let leaveCall: Set<String> = ["Leave call", "Părăsiți apelul", "Părăsește apelul", "Ieșiți din apel", "Ieși din apel"]
+
     // Tiles (and the People panel's per-person controls)
     static let moreOptions: [Pattern] = [("More options for ", ""), ("More actions for ", ""), ("Mai multe opțiuni pentru ", ""),
                                          ("Alte opțiuni pentru ", ""), ("Mai multe acțiuni pentru ", "")]
@@ -67,6 +82,51 @@ enum MeetStrings {
     static let others = [" others", " more", " alții", " altele", " alte persoane"]
     static let notNames: Set<String> = ["external participants", "participanți externi", "someone", "cineva", "multiple people",
                                         "everyone", "toată lumea", "toți"]
+
+    // Captions control. Like the mic, the button names the action ("Turn on captions": they are off); the call log
+    // also showed a toggle, `AXCheckBox "Captions and translation"` (value 0/1), and "Turn off live captions".
+    // Matched without a trailing shortcut ("Turn on captions (c)"). Romanian unverified.
+    static let captionsTurnOn: Set<String> = ["Turn on captions", "Turn on live captions", "Activează subtitrările",
+                                              "Activați subtitrările", "Activează subtitrările live", "Activați subtitrările live"]
+    static let captionsTurnOff: Set<String> = ["Turn off captions", "Turn off live captions", "Dezactivează subtitrările",
+                                               "Dezactivați subtitrările", "Dezactivează subtitrările live", "Dezactivați subtitrările live"]
+    static let captionsToggle: Set<String> = ["Captions and translation", "Subtitrări și traducere", "Subtitrări și traduceri"]
+
+    // Hands. Your own button names the action; a host sees "Lower X's hand" on raised hands. Romanian unverified.
+    static let raiseHand: Set<String> = ["Raise hand", "Ridică mâna", "Ridicați mâna"]
+    static let lowerHand: Set<String> = ["Lower hand", "Coboară mâna", "Coborâți mâna"]
+    static let handUp: [Pattern] = [("Lower ", "'s hand"), ("Coboară mâna pentru ", ""), ("Coborâți mâna pentru ", ""),
+                                    ("Coborâți mâna lui ", "")]
+    static let handLowered: [Pattern] = [("", " lowered their hand"), ("", " has lowered their hand"), ("", " lowered a hand"),
+                                         ("", " lowered hand"), ("", " a coborât mâna")]
+
+    /// "X reacted with 👍" announcements. Reactions on tiles are bare emoji next to the tile's controls.
+    static let reacted = [" reacted with ", " reacted ", " a reacționat cu ", " a reacționat "]
+
+    // Screen sharing: Meet calls someone else's share "presenting" (see `presenting`); these are the "sharing" wordings
+    // and your own share, which only your page shows. Romanian unverified.
+    static let startedSharing: [Pattern] = [("", " started sharing their screen"), ("", " started sharing the screen"),
+                                            ("", " is sharing their screen"), ("", " is sharing the screen"),
+                                            ("", " a început să partajeze ecranul"), ("", " partajează ecranul")]
+    static let stoppedSharing: [Pattern] = [("", " stopped sharing their screen"), ("", " stopped sharing the screen"),
+                                            ("", " a oprit partajarea ecranului"), ("", " nu mai partajează ecranul")]
+    static let selfSharingButtons: Set<String> = ["Stop presenting", "Stop sharing", "Stop sharing screen", "Oprește prezentarea",
+                                                  "Opriți prezentarea", "Oprește partajarea", "Opriți partajarea"]
+    static let selfSharingTexts: Set<String> = ["You are presenting to everyone", "You're presenting to everyone", "You are presenting",
+                                                "You're presenting", "You are sharing your screen", "You're sharing your screen",
+                                                "Prezentați tuturor", "Prezinți tuturor"]
+
+    // The same account is in the call on another device (a phone): Meet offers to join here too or switch here.
+    // Romanian unverified.
+    static let elsewhereButtons: Set<String> = ["Join here too", "Switch here", "Participați și aici", "Participă și aici",
+                                                "Comutați aici", "Comută aici"]
+    static let elsewhereTexts: Set<String> = ["You're in this call on another device", "You are in this call on another device",
+                                              "You're already in this call on another device", "You joined from another device",
+                                              "You've joined from another device", "You switched to another device",
+                                              "You've switched to another device", "This call is now on another device",
+                                              "Participați la acest apel de pe alt dispozitiv", "Ești în acest apel pe alt dispozitiv",
+                                              "V-ați alăturat de pe alt dispozitiv", "Te-ai alăturat de pe alt dispozitiv",
+                                              "Ați comutat pe alt dispozitiv", "Ai comutat pe alt dispozitiv"]
 
     /// The captions language control ("Meeting language" combo box in the captions bar).
     static let languageControls: Set<String> = ["Meeting language", "Limba întâlnirii", "Limba ședinței", "Limba apelului",
@@ -122,7 +182,8 @@ struct MeetCaptionBlock: Sendable, Hashable {
 
 enum MeetToast: Sendable, Hashable {
     case joined(String, external: Bool), left(String), presenting(String), stoppedPresenting(String), chat(String, String),
-         selfMic(muted: Bool), hand(String), waiting(String?, String)
+         selfMic(muted: Bool), hand(String), waiting(String?, String),
+         reaction(String, String), handLowered(String), sharing(String, started: Bool), elsewhere(String)
 }
 
 /// What one read of the Meet page shows.
@@ -141,6 +202,17 @@ struct MeetPage: Sendable {
     var toasts: [MeetToast] = []
     var language: String?
     var ended = false
+    var phase: MeetPhase = .unknown
+    /// Captions on or off as Meet's own control (or, failing that, the captions region) says; nil when unknown.
+    var captionsOn: Bool?
+    /// The control that turns captions on, while they are off.
+    var captionsControl: Int?
+    /// Your raised hand, from your own button.
+    var selfHand: Bool?
+    /// People whose tiles offer "Lower X's hand".
+    var hands: [String] = []
+    /// Your own screen share is on.
+    var selfSharing = false
 
     mutating func person(_ name: String, muted m: Bool? = nil) {
         guard MeetParse.plausibleName(name) else { return }
@@ -149,7 +221,70 @@ struct MeetPage: Sendable {
     }
 }
 
+/// Which screen a Meet tab shows: the pre-join "green room", waiting to be let in, the call, or its end screen.
+enum MeetPhase: String, Sendable, Hashable {
+    case unknown, preJoin, asking, inCall, ended
+}
+
 enum MeetParse {
+    /// Pre-join vs call vs end screen. The mic and camera buttons exist on both sides of Join, so only "Leave call"
+    /// means the call; "Join now" / "Ask to join" / "Ready to join?" mean the green room.
+    static func phase(_ nodes: [MeetNode]) -> MeetPhase {
+        var join = false, asking = false, ended = false
+        var buttons = Set<String>()
+        for n in nodes {
+            let label = dots(n.label), text = n.role == "AXStaticText" ? dots(n.text) : ""
+            if n.role == "AXButton" {
+                if MeetStrings.leaveCall.contains(label) { return .inCall }
+                buttons.insert(label)
+            }
+            for s in [label, text] where !s.isEmpty {
+                if MeetStrings.endTexts.contains(s) { ended = true }
+                if MeetStrings.asking.contains(s) { asking = true }
+                if MeetStrings.joinButtons.contains(s) || MeetStrings.preJoinTitles.contains(s) || MeetStrings.otherWaysToJoin.contains(s) { join = true }
+            }
+        }
+        if ended || MeetStrings.endButtons.contains(where: { $0.isSubset(of: buttons) }) { return .ended }
+        if asking { return .asking }
+        return join ? .preJoin : .unknown
+    }
+
+    private static func dots(_ s: String) -> String { s.replacingOccurrences(of: "...", with: "…") }
+
+    /// A control's label without its keyboard shortcut: "Turn on captions (c)" → "Turn on captions".
+    static func bare(_ label: String) -> String {
+        guard label.hasSuffix(")"), let r = label.range(of: " (", options: .backwards), label.distance(from: r.lowerBound, to: label.endIndex) <= 24 else { return label }
+        return String(label[..<r.lowerBound])
+    }
+
+    /// A checkbox's AXValue: "1" checked, "0" not.
+    static func checked(_ v: String?) -> Bool? { v == "1" ? true : v == "0" ? false : nil }
+
+    /// Only emoji (a reaction): "👍", "❤️", "👏🏽".
+    static func isEmoji(_ s: String) -> Bool {
+        guard !s.isEmpty, s.count <= 3 else { return false }
+        return s.unicodeScalars.allSatisfy { u in
+            u.properties.isEmojiPresentation || (u.properties.isEmoji && u.value > 0x2100) || u.value == 0xFE0F || u.value == 0x200D
+                || (0x1F3FB...0x1F3FF).contains(u.value)
+        } && s.unicodeScalars.contains { $0.properties.isEmoji && $0.value > 0x2100 }
+    }
+
+    /// Captions state from Meet's controls: a button naming the action wins over the toggle's value.
+    static func captionsControl(_ n: MeetNode) -> (on: Bool, pressable: Bool)? {
+        guard n.role == "AXButton" || n.role == "AXCheckBox" else { return nil }
+        let b = bare(n.label)
+        if MeetStrings.captionsTurnOn.contains(b) { return n.role == "AXCheckBox" && checked(n.value) == true ? (true, false) : (false, true) }
+        if MeetStrings.captionsTurnOff.contains(b) { return (true, false) }
+        if n.role == "AXCheckBox", MeetStrings.captionsToggle.contains(b), let c = checked(n.value) { return (c, !c) }
+        return nil
+    }
+
+    /// "Meet - abc-defg-hij" → "abc-defg-hij".
+    static func code(inTitle title: String) -> String? {
+        guard let r = title.range(of: #"\b[a-z]{3,4}-[a-z]{4}-[a-z]{3,4}\b"#, options: .regularExpression) else { return nil }
+        return String(title[r])
+    }
+
     static func clean(_ s: String) -> String {
         s.replacingOccurrences(of: "’", with: "'").replacingOccurrences(of: "\u{a0}", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
     }
@@ -225,6 +360,16 @@ enum MeetParse {
         if let first = s.components(separatedBy: ". ").first, let n = name(first.hasSuffix(".") ? String(first.dropLast()) : first, MeetStrings.startedPresenting),
            plausibleName(n) { return [.presenting(n)] }
         if let n = name(bare, MeetStrings.handRaised), plausibleName(n) { return [.hand(n)] }
+        if let n = name(bare, MeetStrings.handLowered), plausibleName(n) { return [.handLowered(n)] }
+        if let n = name(bare, MeetStrings.startedSharing), plausibleName(n) { return [.sharing(n, started: true)] }
+        if let n = name(bare, MeetStrings.stoppedSharing), plausibleName(n) { return [.sharing(n, started: false)] }
+        if MeetStrings.elsewhereTexts.contains(bare) { return [.elsewhere(bare)] }
+        for sep in MeetStrings.reacted {
+            if let r = bare.range(of: sep) {
+                let who = clean(String(bare[..<r.lowerBound])), what = clean(String(bare[r.upperBound...]))
+                if plausibleName(who), !what.isEmpty, what.count <= 40 { return [.reaction(who, what)] }
+            }
+        }
         if MeetStrings.waiting.contains(where: { s.localizedCaseInsensitiveContains($0) }) { return [.waiting(nil, s)] }
         return []
     }
@@ -284,6 +429,8 @@ enum MeetParse {
     static func page(_ nodes: [MeetNode]) -> MeetPage {
         var p = MeetPage()
         var endButtons = Set<String>()
+        var control: Bool?
+        var buttonEnd = 0
         var i = 0
         while i < nodes.count {
             let n = nodes[i], label = n.label
@@ -292,6 +439,23 @@ enum MeetParse {
                 p.captions = captionBlocks(nodes, region: i)
                 i = subtreeEnd(nodes, i)
                 continue
+            }
+            if control == nil, let c = captionsControl(n) {
+                control = c.on
+                if c.pressable { p.captionsControl = i }
+            }
+            if n.role == "AXButton" || n.role == "AXCheckBox", !label.isEmpty {
+                let b = bare(label)
+                if MeetStrings.raiseHand.contains(b) { p.selfHand = n.role == "AXCheckBox" ? checked(n.value) ?? false : false }
+                else if MeetStrings.lowerHand.contains(b) { p.selfHand = true }
+                else if MeetStrings.selfSharingButtons.contains(b) { p.selfSharing = true }
+                else if MeetStrings.elsewhereButtons.contains(b), !p.toasts.contains(.elsewhere(b)) { p.toasts.append(.elsewhere(b)) }
+                if let o = name(label, MeetStrings.handUp), plausibleName(o), !p.hands.contains(o) { p.hands.append(o) }
+            }
+            if n.role == "AXButton" { buttonEnd = max(buttonEnd, subtreeEnd(nodes, i)) }
+            if n.role == "AXImage", i >= buttonEnd, isEmoji(label), let o = tileOwner(nodes, i) {
+                let r = MeetToast.reaction(o, label)
+                if !p.toasts.contains(r) { p.toasts.append(r) }
             }
             if !label.isEmpty {
                 if n.role == "AXButton", p.selfMuted == nil, let m = micState(label) {
@@ -333,7 +497,10 @@ enum MeetParse {
             if n.role == "AXStaticText" {
                 let t = n.text
                 if MeetStrings.endTexts.contains(t) { p.ended = true }
-                if let o = name(t, MeetStrings.presentationTile) {
+                if MeetStrings.selfSharingTexts.contains(t) { p.selfSharing = true }
+                if isEmoji(t) {
+                    if i >= buttonEnd, let o = tileOwner(nodes, i), case let r = MeetToast.reaction(o, t), !p.toasts.contains(r) { p.toasts.append(r) }
+                } else if let o = name(t, MeetStrings.presentationTile) {
                     if !p.presentations.contains(o) { p.presentations.append(o) }
                 } else if let o = name(t, MeetStrings.presenting), !t.contains(". ") {
                     if !p.presenting.contains(o) { p.presenting.append(o) }
@@ -344,6 +511,9 @@ enum MeetParse {
             i += 1
         }
         if MeetStrings.endButtons.contains(where: { $0.isSubset(of: endButtons) }) { p.ended = true }
+        p.captionsOn = control ?? (p.captionIndex != nil ? true : nil)
+        if p.captionsOn != false { p.captionsControl = nil }
+        p.phase = phase(nodes)
         return p
     }
 }
@@ -365,16 +535,73 @@ struct MeetTracker {
     private var segmentBase: [Int: String] = [:]
     private var closed: Set<Int> = []
     private var captionsSeen = false
+    private var selfHand: Bool?
+    private var handSeen: [String: Double] = [:]
+    private var handUp: Set<String> = []
+    private var sharingSeen: Double?
+
+    /// Turn Meet's captions on once per call when they are off (set from Settings.autoEnableCaptions).
+    var autoCaptions = false
+    /// Captions on/off as last read; nil until a read shows it.
+    private(set) var captionsOn: Bool?
+    private var captionsWereOn = false
+    private var captionsOffSince: Double?
+    private var inCallSince: Double?
+    private var inCall = false
+    private var pressedAt: Double?
+    private var pressDone = false
+    private(set) var health = MeetHealth()
+    private var status = Status()
 
     static let pause = 2.5
     static let alreadyThere = 10.0
     static let maxText = 500
+    /// In the call this long before captions are turned on; the press must show within `pressTimeout`.
+    static let settle = 2.0
+    static let pressTimeout = 3.0
+    /// Captions off this long before `captionsOff` is reported.
+    static let offAfter = 5.0
 
     struct Changes {
         var selfMuted: Bool?
         var ended = false
         var speakers: [String] = []
         var changed = false
+        /// Press Meet's "turn on captions" control now (the page's `captionsControl`).
+        var pressCaptions = false
+    }
+
+    /// What the session shows about the page itself.
+    struct Status: Equatable, Sendable {
+        var captionsOff = false
+        var health: String?
+        var missing: [MeetHealth.Landmark] = []
+    }
+
+    func status(now: Double) -> Status {
+        Status(captionsOff: captionsOff(now: now), health: health.hint, missing: health.missing)
+    }
+
+    /// Captions stay off: the auto-enable is off, failed, or the user turned them off.
+    func captionsOff(now: Double) -> Bool {
+        guard inCall, captionsOn == false, let since = captionsOffSince else { return false }
+        if pressedAt != nil { return pressDone }
+        return now - since >= Self.offAfter
+    }
+
+    /// Pressing the captions control failed: no retry.
+    mutating func captionsPressFailed() { pressDone = true }
+
+    /// A page read that found nothing (an empty or unreadable web area): only the health check learns from it.
+    mutating func unreadable(at t: Double) -> Changes {
+        health.read(mic: false, tiles: false, region: false, captionsOn: captionsOn, inCall: true, at: t)
+        return Changes(changed: updateStatus(t))
+    }
+
+    private mutating func updateStatus(_ t: Double) -> Bool {
+        let s = status(now: t)
+        defer { status = s }
+        return s != status
     }
 
     init(platform: String = "Google Meet") { context.platform = platform }
@@ -509,22 +736,86 @@ struct MeetTracker {
             case let .selfMic(m):
                 if p.selfMuted == nil, let c = setMuted(m, at: t) { ch.selfMuted = c }
             case let .hand(raw):
-                event(.handRaised, t, who: person(raw, t).map { context.participants[$0].name } ?? raw)
+                let name = person(raw, t).map { context.participants[$0].name } ?? raw
+                if handUp.insert(name).inserted || handSeen[name] == nil { event(.handRaised, t, who: name) }
+            case let .handLowered(raw):
+                let name = person(raw, t).map { context.participants[$0].name } ?? raw
+                handUp.remove(name)
+                handSeen[name] = nil
+                event(.handRaised, t, who: name, text: "lowered")
             case let .waiting(who, text):
                 event(.waiting, t, who: who, text: text)
+            case let .reaction(raw, what):
+                event(.reaction, t, who: person(raw, t).map { context.participants[$0].name } ?? raw, text: what)
+            case let .sharing(raw, started):
+                event(started ? .screenShareStarted : .screenShareStopped, t, who: person(raw, t).map { context.participants[$0].name } ?? raw)
+            case let .elsewhere(text):
+                event(.joinedElsewhere, t, who: selfName ?? "You", text: text)
             }
         }
         for (name, last) in presentingSeen where !showing.contains(name) && t - last > 8 {
             presentingSeen[name] = nil
             event(.presentingStopped, t, who: name)
         }
+        inCall = ![.preJoin, .asking, .ended].contains(p.phase) && !p.ended
+        hands(p, at: t)
+        let me = selfName ?? "You"
+        if p.selfSharing {
+            if sharingSeen == nil { event(.screenShareStarted, t, who: me) }
+            sharingSeen = t
+        } else if let s = sharingSeen, t - s > 8 {
+            sharingSeen = nil
+            event(.screenShareStopped, t, who: me)
+        }
+        ch.pressCaptions = captions(p, at: t)
+        health.read(mic: p.micIndex != nil, tiles: !p.people.isEmpty || p.selfName != nil || !p.presentations.isEmpty,
+                    region: p.captionIndex != nil, captionsOn: captionsOn, inCall: inCall, at: t)
         if let m = p.selfMuted, let c = setMuted(m, at: t) { ch.selfMuted = c }
         if let lang = p.language { context.captionLanguage = lang }
         if firstPageAt == nil { firstPageAt = t }
         if let blocks = p.captions { ch.speakers = captions(blocks, at: t) }
         if p.ended { ch.ended = end(at: t) }
-        ch.changed = before != context || ch.selfMuted != nil
+        ch.changed = updateStatus(t) || before != context || ch.selfMuted != nil
         return ch
+    }
+
+    /// Captions on/off events, and whether to turn them on: once per call, only if they were never on in this call
+    /// (so a user who turned them off keeps them off), and never again after one press.
+    private mutating func captions(_ p: MeetPage, at t: Double) -> Bool {
+        if let on = p.captionsOn {
+            if let old = captionsOn, old != on {
+                event(on ? .captionsOn : .captionsOff, t, text: on && pressedAt != nil && !pressDone ? "Turned on by Earshot" : nil)
+            }
+            captionsOn = on
+            if on { captionsWereOn = true; captionsOffSince = nil } else if captionsOffSince == nil { captionsOffSince = t }
+        }
+        guard inCall else { inCallSince = nil; return false }
+        if inCallSince == nil { inCallSince = t }
+        if let at = pressedAt {
+            if !pressDone, captionsOn == true || t - at >= Self.pressTimeout { pressDone = true }
+            return false
+        }
+        guard autoCaptions, !captionsWereOn, captionsOn == false, p.captionsControl != nil, let since = inCallSince,
+              t - since >= Self.settle else { return false }
+        pressedAt = t
+        return true
+    }
+
+    private mutating func hands(_ p: MeetPage, at t: Double) {
+        if let h = p.selfHand {
+            if let old = selfHand, old != h { event(.handRaised, t, who: selfName ?? "You", text: h ? nil : "lowered") }
+            selfHand = h
+        }
+        for raw in p.hands {
+            guard let i = person(raw, t) else { continue }
+            let name = context.participants[i].name
+            if handUp.insert(name).inserted { event(.handRaised, t, who: name) }
+            handSeen[name] = t
+        }
+        for (name, last) in handSeen where t - last > 8 {
+            handSeen[name] = nil
+            if handUp.remove(name) != nil { event(.handRaised, t, who: name, text: "lowered") }
+        }
     }
 
     /// Caption blocks as shown now (oldest first). A block grows while its speaker talks; a pause of 2.5 s or 500
@@ -607,12 +898,48 @@ struct MeetTracker {
     }
 }
 
+// MARK: Health (pure: can the page still be read?)
+
+/// While in a call, the landmarks a readable Meet page always has: your mic button, the participant tiles, and the
+/// captions region while captions are on. One missing for `grace` seconds of reading means Meet's page changed
+/// (or can't be read), so names and mute detection are off. Time not spent reading (the tab in the background)
+/// doesn't count. The captions region may go away while nobody talks, so once found it counts as there.
+struct MeetHealth: Sendable, Hashable {
+    enum Landmark: String, Sendable, Hashable { case mic, tiles, captions }
+    static let grace = 20.0
+    /// A pause between reads longer than this restarts the clock (the page was away).
+    static let gap = 4.0
+
+    private var lastRead: Double?
+    private var seen: [Landmark: Double] = [:]
+    private var regionFound = false
+    private(set) var missing: [Landmark] = []
+
+    var hint: String? {
+        if missing.contains(.mic) || missing.contains(.tiles) { return "Earshot can't read this Meet page; speaker names and mute detection are off" }
+        if missing.contains(.captions) { return "Earshot can't read Meet's captions; speaker names from captions are off" }
+        return nil
+    }
+
+    mutating func read(mic: Bool, tiles: Bool, region: Bool, captionsOn: Bool?, inCall: Bool, at t: Double) {
+        guard inCall else { lastRead = nil; seen = [:]; missing = []; regionFound = false; return }
+        if lastRead.map({ t - $0 > Self.gap }) ?? true { seen = [.mic: t, .tiles: t, .captions: t] }
+        lastRead = t
+        if mic { seen[.mic] = t }
+        if tiles { seen[.tiles] = t }
+        if region { regionFound = true }
+        if regionFound || captionsOn != true { seen[.captions] = t }
+        missing = [Landmark.mic, .tiles, .captions].filter { t - (seen[$0] ?? t) >= Self.grace }
+    }
+}
+
 // MARK: Live observer
 
 /// Reads Google Meet's page in a Chromium browser or Safari through the Accessibility API and keeps a
 /// `MeetingContext`: room, people, captions (who spoke when), your mute state and the end of the call.
-/// Needs Earshot in System Settings → Privacy & Security → Accessibility. Read-only: nothing is clicked or sent.
-/// Callbacks run on the observer's own threads.
+/// Needs Earshot in System Settings → Privacy & Security → Accessibility. Read-only, with one exception: with
+/// `autoEnableCaptions` it presses Meet's own "turn on captions" control, once per call. Callbacks run on the
+/// observer's own threads.
 final class MeetObserver: @unchecked Sendable {
     static var regionLabels: Set<String> { MeetStrings.captionRegions }
     static var selfLabels: Set<String> { MeetStrings.selfNames }
@@ -632,6 +959,7 @@ final class MeetObserver: @unchecked Sendable {
     private var endedFired = false
     private var lastChange = Date.distantPast
     private var pendingChange = false
+    private var logged = MeetTracker.Status()
 
     // On the queue
     private var timer: DispatchSourceTimer?
@@ -642,6 +970,8 @@ final class MeetObserver: @unchecked Sendable {
     private var lostAt: Date?
     private var wasActive = false
     private var setManual = false
+    /// Full scans every 0.5 s until then: the captions press is being checked.
+    private var boostUntil = Date.distantPast
 
     // On the AX thread
     private var axThread: AXThread?
@@ -662,6 +992,18 @@ final class MeetObserver: @unchecked Sendable {
 
     /// The Meet page is found and being read.
     var active: Bool { lock.withLock { reading } }
+
+    /// Turn Meet's captions on when a call starts with them off (one press per call, never retried).
+    var autoEnableCaptions: Bool {
+        get { lock.withLock { tracker.autoCaptions } }
+        set { lock.withLock { tracker.autoCaptions = newValue } }
+    }
+
+    /// Captions left off, and whether the page can be read as expected.
+    var status: MeetTracker.Status {
+        let now = clock()
+        return lock.withLock { tracker.status(now: now) }
+    }
 
     var onSelfMute: (@Sendable (Bool) -> Void)? {
         get { lock.withLock { handlers.selfMute } }
@@ -727,6 +1069,9 @@ final class MeetObserver: @unchecked Sendable {
         }
     }
 
+    /// The pre-join watcher switched the page tree on and hands it over: this observer switches it off at stop().
+    func adoptWebTree() { queue.async { [self] in setManual = true } }
+
     func stop() {
         queue.async { [self] in
             timer?.cancel()
@@ -768,7 +1113,7 @@ final class MeetObserver: @unchecked Sendable {
                     lostAt = nil
                     wasActive = true
                     lock.withLock { reading = true }
-                    LiveDebug.log("[meet] reading \(found.url ?? "Meet page")")
+                    LiveDebug.log("[meet] reading the page")
                     fullScan()
                     return
                 }
@@ -784,7 +1129,7 @@ final class MeetObserver: @unchecked Sendable {
             flushChange()
             return
         }
-        if tick % 6 == 0 || (lock.withLock { mic == nil } && tick % 2 == 0) {
+        if tick % 6 == 0 || ((lock.withLock { mic == nil } || now < boostUntil) && tick % 2 == 0) {
             fullScan()
         } else if tick % 2 == 0, let region {
             let (nodes, _) = Self.captionNodes(region, depth: 0, header: true)
@@ -806,7 +1151,12 @@ final class MeetObserver: @unchecked Sendable {
     private func fullScan() {
         guard let web else { return }
         let (nodes, elements) = Self.walk(web)
-        guard !nodes.isEmpty else { return }
+        guard !nodes.isEmpty else {
+            let t = clock()
+            deliver(lock.withLock { tracker.unreadable(at: t) })
+            logStatus(nodes: 0, phase: .unknown)
+            return
+        }
         let page = MeetParse.page(nodes)
         region = page.captionIndex.map { elements[$0] }
         let newMic = page.micIndex.map { elements[$0] }
@@ -824,7 +1174,30 @@ final class MeetObserver: @unchecked Sendable {
             return c
         }
         if let newMic { axThread?.async { [weak self] in self?.observe(newMic) } }
+        if ch.pressCaptions, let i = page.captionsControl { pressCaptions(elements[i], nodes[i]) }
+        logStatus(nodes: nodes.count, phase: page.phase)
         deliver(ch)
+    }
+
+    /// Presses Meet's captions control, after checking it is still that control. A failure isn't retried.
+    private func pressCaptions(_ e: AXUIElement, _ n: MeetNode) {
+        var ok = false
+        if let r = Self.read(e), MeetParse.captionsControl(MeetNode(depth: 0, role: r.role, title: r.title, desc: r.desc, value: r.value))?.pressable == true {
+            ok = AXUIElementPerformAction(e, kAXPressAction as CFString) == .success
+        }
+        LiveDebug.log("[meet] captions off: pressed \(n.role) \"\(n.label)\" \(ok ? "ok" : "failed")")
+        if ok { boostUntil = Date().addingTimeInterval(MeetTracker.pressTimeout + 0.5) } else { lock.withLock { tracker.captionsPressFailed() } }
+    }
+
+    private func logStatus(nodes: Int, phase: MeetPhase) {
+        let s = status
+        let (old, captions) = lock.withLock { () -> (MeetTracker.Status, Bool?) in defer { logged = s }; return (logged, tracker.captionsOn) }
+        guard s != old else { return }
+        if s.captionsOff != old.captionsOff { LiveDebug.log("[meet] captions \(s.captionsOff ? "stay off" : "on or pending")") }
+        if s.missing != old.missing {
+            LiveDebug.log("[meet] health: \(s.missing.isEmpty ? "ok" : "missing " + s.missing.map(\.rawValue).joined(separator: ","))"
+                          + " (\(nodes) nodes, phase \(phase.rawValue), captions \(captions.map { $0 ? "on" : "off" } ?? "?"))")
+        }
     }
 
     private func deliver(_ ch: MeetTracker.Changes) {
@@ -899,7 +1272,9 @@ final class MeetObserver: @unchecked Sendable {
         guard AXUIElementCopyMultipleAttributeValues(e, attributeNames, AXCopyMultipleAttributeOptions(rawValue: 0), &out) == .success,
               let a = out as? [AnyObject], a.count == 5, let role = a[0] as? String else { return nil }
         func s(_ v: AnyObject) -> String? { (v as? String).flatMap { $0.isEmpty ? nil : $0 } }
-        return (role, s(a[1]), s(a[2]), s(a[3]), a[4] as? [AXUIElement] ?? [])
+        // A checkbox's value is a number: kept as "0" / "1" (the captions toggle).
+        let value = s(a[3]) ?? (role == "AXCheckBox" ? (a[3] as? NSNumber)?.stringValue : nil)
+        return (role, s(a[1]), s(a[2]), value, a[4] as? [AXUIElement] ?? [])
     }
 
     private static func node(_ r: (role: String, title: String?, desc: String?, value: String?, kids: [AXUIElement]), _ e: AXUIElement, _ depth: Int) -> MeetNode {
@@ -1021,14 +1396,18 @@ final class MeetObserver: @unchecked Sendable {
         return nil
     }
 
-    /// A Meet tab still exists (in the background): a tab or address bar outside web content names it.
-    static func meetTabExists(_ app: AXUIElement) -> Bool {
-        for (w, title) in windows(app) {
-            if looksMeet(title) { return true }
+    /// A Meet tab still exists (in the background): a tab or address bar outside web content names it. `limit`: elements
+    /// read across all windows.
+    static func meetTabExists(_ app: AXUIElement, limit: Int = 1500) -> Bool {
+        let all = windows(app)
+        if all.contains(where: { looksMeet($0.1) }) { return true }
+        var budget = limit
+        for (w, _) in all {
             var queue = [w], i = 0
-            while i < queue.count, i < 1500 {
+            while i < queue.count, budget > 0 {
                 let e = queue[i]
                 i += 1
+                budget -= 1
                 guard let role = attribute(e, kAXRoleAttribute) as? String, role != "AXWebArea" else { continue }
                 for key in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute] {
                     if let s = attribute(e, key) as? String, looksMeet(s) { return true }
@@ -1050,6 +1429,60 @@ final class MeetObserver: @unchecked Sendable {
             if let r = webArea(in: w), let url = r.url, let code = meetCode(url) { return (code, pageTitle(r.title), url) }
         }
         return (nil, pageTitle(meet[0].1), nil)
+    }
+
+    // MARK: Before the call (the pre-join watcher)
+
+    struct Probe: Sendable {
+        var windowTitle: String
+        var code: String?
+        var url: String?
+        var title: String?
+        var phase: MeetPhase
+        /// The walk hit its node limit: a page that big with no pre-join strings read is a call.
+        var truncated = false
+    }
+
+    private static func axApp(_ bundleID: String) -> AXUIElement? {
+        guard trusted, let pid = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first?.processIdentifier else { return nil }
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.5)
+        return app
+    }
+
+    /// A Meet tab's window title: "Meet - abc-defg-hij" or "Meet - Weekly sync".
+    static func isMeetTitle(_ title: String) -> Bool { looksMeet(title) }
+
+    /// The browser's window titles: the cheap first look, nothing inside the windows is read. nil if it isn't running.
+    static func windowTitles(bundleID: String) -> [String]? {
+        axApp(bundleID).map { windows($0).map { MeetParse.clean($0.1) } }
+    }
+
+    /// One Meet window in depth: its page's URL, and which screen it shows from one bounded walk of the page.
+    static func probe(bundleID: String, windowTitle: String, limit: Int = 3000) -> Probe? {
+        guard let app = axApp(bundleID), let w = windows(app).first(where: { MeetParse.clean($0.1) == windowTitle })?.0 else { return nil }
+        var p = Probe(windowTitle: windowTitle, code: MeetParse.code(inTitle: windowTitle), title: pageTitle(windowTitle), phase: .unknown)
+        guard let web = webArea(in: w) else { return p }
+        if let url = web.url, let code = meetCode(url) { p.url = url; p.code = code }
+        p.title = pageTitle(web.title) ?? p.title
+        let (nodes, _) = walk(web.element, limit: limit)
+        p.phase = MeetParse.phase(nodes)
+        p.truncated = nodes.count >= limit
+        return p
+    }
+
+    /// A Meet tab is open in this browser, maybe behind another tab of its window.
+    static func meetTabOpen(bundleID: String, limit: Int = 1500) -> Bool { axApp(bundleID).map { meetTabExists($0, limit: limit) } ?? false }
+
+    /// Chromium builds the page's accessibility tree only on request. Returns true when this call switched it on.
+    static func enableWebTree(bundleID: String) -> Bool {
+        guard let app = axApp(bundleID), attribute(app, "AXManualAccessibility") as? Bool != true else { return false }
+        return AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue) == .success
+    }
+
+    static func disableWebTree(bundleID: String) {
+        guard let app = axApp(bundleID) else { return }
+        AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanFalse)
     }
 }
 

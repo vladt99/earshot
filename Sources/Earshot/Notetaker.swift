@@ -24,6 +24,10 @@ struct MeetingManifest: Codable {
     var speakerHints: [SpeakerHint] = []
     /// A session that is never saved (Live Captions): recovery deletes its folder.
     var discard: Bool? = nil
+    /// `language` was picked by the user for this meeting: the polish keeps it instead of the caption language.
+    var languagePinned: Bool? = nil
+    /// Names the user gave live speakers ("Who is this?").
+    var speakerPicks: [SpeakerPick]? = nil
     var saved = false
 
     static func url(_ folder: URL) -> URL { folder.appendingPathComponent("meeting.json") }
@@ -65,7 +69,8 @@ enum MeetingVoices {
     static func renamed(in folder: URL, from old: String, to new: String) {
         var voices = read(folder)
         guard let voice = voices.removeValue(forKey: old) else { return }
-        voices[new] = voice
+        // Already a speaker of this meeting: the two clusters were one person.
+        voices[new] = voices[new].map { a in a.count == voice.count ? zip(a, voice).map { ($0 + $1) / 2 } : voice } ?? voice
         write(voices, to: folder)
         if Settings.rememberVoices { Store.shared.learnVoice(new, voice) }
     }

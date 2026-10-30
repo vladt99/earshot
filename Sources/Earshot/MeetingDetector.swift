@@ -235,11 +235,12 @@ final class MeetingDetector {
         pendingRelease[id] = nil
         appsInMeeting.removeAll { $0 == id }
         ignored.remove(id)
+        PreJoinWatcher.shared.micReleased(id)
         let m = detected.removeValue(forKey: id) ?? Self.meeting(for: id)
         if AppState.shared.detectedMeeting?.key == id {
             // A detected call that was never answered ended: take its prompt down.
             AppState.shared.detectedMeeting = nil
-            if MeetingController.shared.session == nil, !MeetingController.shared.isStopping { MeetingPanel.shared.hide() }
+            if MeetingController.shared.session == nil, !MeetingController.shared.isStopping, !AppState.shared.showsPreJoin { MeetingPanel.shared.hide() }
         }
         EventBus.shared.publish("meeting.ended_detected", ["app": m.appName, "app_bundle_id": id])
         MeetingController.shared.detectedMeetingEnded(m)
@@ -247,7 +248,13 @@ final class MeetingDetector {
 
     private func didDetect(_ m: DetectedMeeting) {
         EventBus.shared.publish("meeting.detected", ["app": m.appName, "app_bundle_id": m.appBundleID, "title": m.title])
-        guard !ignored.contains(m.key) else { return }
+        guard !ignored.contains(m.key), !PreJoinWatcher.shared.intercept(m) else { return }
+        announce(m)
+    }
+
+    /// The usual "Meeting detected" handling (prompt, or recording in "auto").
+    func announce(_ m: DetectedMeeting) {
+        guard appsInMeeting.contains(m.key), !ignored.contains(m.key) else { return }
         AppState.shared.detectedMeeting = m
         MeetingController.shared.meetingDetected(m)
     }
@@ -345,6 +352,13 @@ enum CalendarLookup {
         }
         return CalendarInfo(eventID: e.eventIdentifier, title: e.title, organizer: e.organizer.flatMap { $0.name ?? email($0) },
                             notes: e.notes, start: e.startDate, end: e.endDate,
-                            attendees: (e.attendees ?? []).map { .init(name: $0.name, email: email($0), status: status($0.participantStatus)) })
+                            attendees: (e.attendees ?? []).map { .init(name: $0.name, email: email($0), status: status($0.participantStatus)) },
+                            seriesID: seriesID(e))
+    }
+
+    /// Shared by every occurrence of a recurring event: the server's id (iCalendar UID), else EventKit's own,
+    /// which recurring occurrences also share.
+    static func seriesID(_ e: EKEvent) -> String? {
+        [e.calendarItemExternalIdentifier, e.calendarItemIdentifier, e.eventIdentifier].lazy.compactMap { $0 }.first { !$0.isEmpty }
     }
 }

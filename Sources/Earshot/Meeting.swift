@@ -24,8 +24,14 @@ struct MeetingSnapshot: Sendable {
     var context: MeetingContext?
     /// You are muted in the meeting app, so your microphone isn't being recorded.
     var selfMuted = false
+    /// The meeting app's captions are off, so speakers can't be named from them.
+    var captionsOff = false
+    /// The meeting page can't be read as expected (layout changed, no access); shown once as a hint.
+    var meetHealth: String? = nil
     /// A Live Captions session that will be saved as a meeting when it stops (`keepSession()`, or a call's captions).
     var kept = false
+    /// "Speaker N" labels the user skipped in the panel's "Who is this?" prompt.
+    var skippedSpeakers: Set<String> = []
 }
 
 /// Starts/stops meeting sessions from detection, UI or API.
@@ -43,6 +49,22 @@ final class MeetingController {
     private var quitting = false
 
     var isStopping: Bool { stopping != nil }
+
+    private var activeSessions = 0
+    private var activeChain: Task<Void, Never>?
+
+    /// Engine.setMeetingActive in call order, true while any session runs (one may start while the last is saving).
+    @discardableResult
+    func sessionActive(_ started: Bool) -> Task<Void, Never> {
+        activeSessions = max(0, activeSessions + (started ? 1 : -1))
+        let active = activeSessions > 0, previous = activeChain
+        let t = Task { @MainActor in
+            await previous?.value
+            await Engine.shared.setMeetingActive(active)
+        }
+        activeChain = t
+        return t
+    }
 
     /// The folder belongs to a session that is recording or still being saved.
     func owns(_ folder: URL) -> Bool {
@@ -85,7 +107,7 @@ final class MeetingController {
                     try? await Task.sleep(for: .seconds(10))
                     guard !Task.isCancelled, self.session == nil, AppState.shared.detectedMeeting?.key == m.key else { return }
                     AppState.shared.detectedMeeting = nil
-                    MeetingPanel.shared.hide()
+                    if !AppState.shared.showsPreJoin { MeetingPanel.shared.hide() }
                 }
             }
         default:
@@ -116,7 +138,7 @@ final class MeetingController {
     /// countdown would.
     func observedMeetingEnded(_ s: MeetingSession) {
         guard session === s, Settings.autoStopAfterMeeting else { return }
-        LiveDebug.log("[meet] call ended: stopping \(s.title)")
+        LiveDebug.log("[meet] call ended: stopping")
         Task { @MainActor in _ = await self.stop(auto: true) }
     }
 
@@ -128,10 +150,12 @@ final class MeetingController {
         return true
     }
 
-    /// `app`: bundle id to capture ("com.google.Chrome"), or nil/"system" for all system audio.
+    /// `app`: bundle id to capture ("com.google.Chrome"), or nil/"system" for all system audio. `language`: picked by the
+    /// user for this meeting (before joining): it wins over the meeting's caption language, live and at polish.
     @discardableResult
     func start(app: String?, title: String?, platform: String? = nil, appName: String? = nil,
-               mic: Bool = true, fromDetection: String? = nil, origin: String = "meeting", save: Bool = true) throws -> MeetingSnapshot {
+               mic: Bool = true, fromDetection: String? = nil, origin: String = "meeting", save: Bool = true,
+               language: String? = nil) throws -> MeetingSnapshot {
         if let session { return session.snapshot }
         dismissTask?.cancel()
         let detected = MeetingDetector.shared.current
@@ -149,7 +173,8 @@ final class MeetingController {
             captureMic: mic,
             origin: origin,
             save: save,
-            call: call
+            call: call,
+            language: language
         )
         do { try s.start() } catch { s.discard(); throw error }
         session = s
@@ -187,14 +212,14 @@ final class MeetingController {
         defer {
             if stopping === s { stopping = nil; stopTask = nil }
             if AppState.shared.meeting?.id == s.id { AppState.shared.meeting = nil }
-            if session == nil, AppState.shared.detectedMeeting == nil { MeetingPanel.shared.hide() }
+            if session == nil, AppState.shared.detectedMeeting == nil, !AppState.shared.showsPreJoin { MeetingPanel.shared.hide() }
             redetect(after: s, auto: auto)
         }
         guard s.save else {
             try? FileManager.default.removeItem(at: s.folder)
             return transcript
         }
-        guard !transcript.segments.isEmpty || FileManager.default.fileExists(atPath: s.folder.appendingPathComponent("others.wav").path) else { return nil }
+        guard !transcript.segments.isEmpty || MeetingAudio.track(s.folder, "others") != nil else { return nil }
         guard Store.shared.insert(transcript) else {
             // The manifest stays unsaved: recovery tries again at the next launch.
             AppState.shared.lastError = "Couldn't save \(transcript.title) to the library. The recording is kept and will be retried at the next launch."
@@ -239,9 +264,11 @@ final class MeetingController {
         s?.closeFiles()
     }
 
-    /// The meeting's transcript is final: export, webhook/SSE `meeting.finalized`, notification.
+    /// The meeting's transcript is final: export, webhook/SSE `meeting.finalized`, notification, then the recording
+    /// is compressed in the background.
     func finalize(_ t: Transcript) {
         PostProcess.finished(t)
+        if let p = t.sourcePath { MeetingAudio.compressLater(URL(fileURLWithPath: p, isDirectory: true)) }
         EventBus.shared.publish("meeting.finalized", ["meeting_id": t.id, "transcript_id": t.id, "title": t.title,
                                                       "speakers": Array(Set(t.segments.compactMap(\.speaker))).sorted()])
         Notifier.post("Meeting saved", body: t.title)
@@ -268,9 +295,8 @@ final class MeetingController {
         guard let t = Store.shared.get(id), ["meeting", "podcast", "appaudio"].contains(t.origin), let folder = t.sourcePath.map(URL.init(fileURLWithPath:)) else {
             throw APIError(404, "No such meeting")
         }
-        let others = folder.appendingPathComponent("others.wav"), me = folder.appendingPathComponent("me.wav")
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: others.path) || fm.fileExists(atPath: me.path) else {
+        let others = MeetingAudio.track(folder, "others") != nil, me = MeetingAudio.track(folder, "me") != nil
+        guard others || me else {
             throw APIError(409, "A meeting needs at least one recorded stream to transcribe")
         }
         guard !AppState.shared.polishing.contains(id) else { throw APIError(409, "This meeting is already being transcribed") }
@@ -280,29 +306,34 @@ final class MeetingController {
         let started = Date()
         let manifest = MeetingManifest.read(folder)
         let context = t.context ?? MeetingContextFile.read(folder)
+        let pinned = manifest?.languagePinned == true ? manifest?.language : nil
         let spoken = Settings.followMeetingLanguage ? context?.captionLanguage.flatMap(Self.languageCode) : nil
-        let options = TranscribeOptions(model: nil, language: spoken ?? t.language, diarize: Settings.diarizeMeetings)
+        let options = TranscribeOptions(model: nil, language: pinned ?? spoken ?? t.language, diarize: Settings.diarizeMeetings)
         var appSegments: [Segment] = [], mine: [Segment] = []
         var model = t.model, language = options.language
         var duration = 0.0
-        if fm.fileExists(atPath: others.path), let samples = await Self.loadTrack(others) {
+        // A track that was there but can't be read fails the pass: a transcript missing one side isn't saved over the old one.
+        if others {
+            guard let samples = await Self.loadTrack(folder, "others") else { throw APIError(500, "Couldn't read the meeting's audio of \(t.title)") }
             duration = Double(samples.count) / SampleSink.rate
             let out = try await Engine.shared.transcribe(samples: samples, options: options, speakerPrefix: "Speaker", context: context)
             model = out.model
             language = language ?? out.language
             appSegments = out.segments.map { var s = $0; s.speaker = s.speaker ?? Settings.participantsName; return s }
             let names = Self.names(for: appSegments, turns: out.turns, words: out.words, voices: out.voices,
-                                   hints: manifest?.speakerHints ?? [], context: context)
+                                   hints: manifest?.speakerHints ?? [], context: context, picks: manifest?.speakerPicks ?? [])
             appSegments = appSegments.map { var s = $0; if let n = s.speaker.flatMap({ names[$0] }) { s.speaker = n }; return s }
             var voices: [String: [Float]] = [:]
             for (label, v) in out.voices { voices[names[label] ?? label] = v }
             MeetingVoices.write(voices, to: folder)
         }
-        if fm.fileExists(atPath: me.path), let samples = await Self.loadTrack(me) {
+        if me {
+            guard let samples = await Self.loadTrack(folder, "me") else { throw APIError(500, "Couldn't read your microphone recording of \(t.title)") }
             duration = max(duration, Double(samples.count) / SampleSink.rate)
             var meOptions = options
             meOptions.diarize = false
-            let out = try await Engine.shared.transcribe(samples: samples, options: meOptions)
+            // Room vocabulary and caption spelling for your track too.
+            let out = try await Engine.shared.transcribe(samples: samples, options: meOptions, context: context)
             mine = out.segments.map { var s = $0; s.speaker = Settings.myName; return s }
         }
         var polished = t
@@ -328,9 +359,16 @@ final class MeetingController {
         return code.isEmpty ? nil : code
     }
 
-    /// Decodes a recorded track off the main actor (a 2 h track is ~460 MB of samples).
+    /// Decodes a recorded track (.wav or .m4a) off the main actor (a 2 h track is ~460 MB of samples).
     nonisolated static func loadTrack(_ url: URL) async -> [Float]? {
-        await Task.detached(priority: .userInitiated) { WAVReader.readMonoPCM16(url) ?? (try? AudioPrep.loadSamples(url)) }.value
+        await Task.detached(priority: .userInitiated) { MeetingAudio.readMono16k(url) ?? (try? AudioPrep.loadSamples(url)) }.value
+    }
+
+    /// A meeting's track by name ("others", "me"), whichever format it is in now.
+    nonisolated static func loadTrack(_ folder: URL, _ name: String) async -> [Float]? {
+        await Task.detached(priority: .userInitiated) {
+            MeetingAudio.load(folder, name) ?? MeetingAudio.track(folder, name).flatMap { try? AudioPrep.loadSamples($0) }
+        }.value
     }
 
     /// Laptop speakers leak the other side into the microphone: a line of yours that repeats what someone else
@@ -366,18 +404,24 @@ final class MeetingController {
         return row[b.count]
     }
 
-    /// "Speaker N" → person: the meeting's captions first (they name whoever talks), then caption hints, then saved
-    /// voices. Names learned from captions are remembered as voices and added to People.
+    /// "Speaker N" → person: names the user picked during the meeting first, then the meeting's captions (they name
+    /// whoever talks), then caption hints, then saved voices. Names learned this way are remembered as voices and
+    /// added to People.
     static func names(for segments: [Segment], turns: [SpeakerTurn] = [], words: [LiveWord] = [], voices: [String: [Float]],
-                      hints: [SpeakerHint], context: MeetingContext? = nil) -> [String: String] {
-        guard Settings.autoNameSpeakers else { return [:] }
+                      hints: [SpeakerHint], context: MeetingContext? = nil, picks: [SpeakerPick] = []) -> [String: String] {
         let turns = turns.isEmpty ? segments.compactMap { s in s.speaker.map { (start: s.start, end: s.end, speaker: $0) } } : turns
-        var names = context.map { SpeakerPipeline.fromCaptions(turns: turns, context: $0, words: words) } ?? [:]
-        let hinted = SpeakerNaming.fromHints(turns: turns.filter { names[$0.speaker] == nil }, hints: hints)
-        names.merge(hinted.filter { !names.values.contains($0.value) }) { a, _ in a }
+        let picked = SpeakerPicker.fromPicks(turns: turns, picks: picks)
+        guard Settings.autoNameSpeakers || !picked.isEmpty else { return [:] }
+        var names = picked
+        if Settings.autoNameSpeakers {
+            let captioned = context.map { SpeakerPipeline.fromCaptions(turns: turns, context: $0, words: words) } ?? [:]
+            names.merge(captioned) { a, _ in a }
+            let hinted = SpeakerNaming.fromHints(turns: turns.filter { names[$0.speaker] == nil }, hints: hints)
+            names.merge(hinted.filter { !names.values.contains($0.value) }) { a, _ in a }
+        }
         if Settings.rememberVoices {
             for (label, name) in names { if let v = voices[label] { Store.shared.learnVoice(name, v) } }
-            let unnamed = voices.filter { names[$0.key] == nil }
+            let unnamed = voices.filter { names[$0.key] == nil && Settings.autoNameSpeakers }
             names.merge(SpeakerNaming.fromVoices(unnamed, known: Store.shared.voices(), taken: Set(names.values))) { a, _ in a }
         }
         let people = Set(Store.shared.people().map(\.name))
@@ -437,12 +481,21 @@ final class MeetingSession {
     private var sleepObservers: [NSObjectProtocol] = []
     private(set) var lines: [Segment] = []
     private var hypotheses: [String: String] = [:]
-    fileprivate var language: String? = Settings.language
+    fileprivate var language: String?
+    /// Picked by the user for this meeting: the caption language doesn't replace it.
+    private let languagePinned: Bool
     /// Model of the latest live pass (Parakeet covers a non-English meeting until Whisper has loaded).
     fileprivate var liveModel: String?
     /// Diarizer speaker id → stable "Speaker N" label, numbered by first appearance.
     private var speakerNumbers: [String: Int] = [:]
+    /// Diarizer speaker id → the name the user picked for it ("Who is this?"); wins over captions and voices.
+    private var pinned: [String: String] = [:]
+    private var skippedSpeakers: Set<String> = []
+    /// Voice of each diarizer speaker id from the last pass.
+    private var liveVoices: [String: [Float]] = [:]
     private var captionsNeedAccess = false
+    /// Captions left off and the Meet page's health, from the observer.
+    private var meetStatus = MeetTracker.Status()
     private var isStopping = false
     /// The speech model failed during the meeting (`asrDown`: right now); the transcript is made from the WAVs.
     private(set) var asrFailed = false
@@ -450,8 +503,10 @@ final class MeetingSession {
     static let speechModelWarning = "Speech model not available — recording continues, transcript will be made after the meeting."
 
     init(appBundle: String?, appName: String, platform: String, title: String, genericTitle: Bool = false, captureMic: Bool,
-         origin: String = "meeting", save: Bool = true, call: DetectedMeeting? = nil) {
+         origin: String = "meeting", save: Bool = true, call: DetectedMeeting? = nil, language: String? = nil) {
         let id = UUID().uuidString.lowercased(), now = Date()
+        self.language = language ?? Settings.language
+        self.languagePinned = language != nil
         self.id = id
         self.startedAt = now
         self.origin = origin
@@ -482,14 +537,23 @@ final class MeetingSession {
         let keeps = save || keepsAsMeeting
         return MeetingManifest(id: id, title: title, appName: appName, appBundle: appBundle, platform: platform,
                                origin: save || !keeps ? origin : "meeting", startedAt: startedAt, captureMic: captureMic,
-                               language: language, notes: notes, speakerHints: hints, discard: keeps ? nil : true)
+                               language: language, notes: notes, speakerHints: hints, discard: keeps ? nil : true,
+                               languagePinned: languagePinned ? true : nil, speakerPicks: picks.isEmpty ? nil : picks)
+    }
+
+    /// The user's picks as the times each named voice talked, for the polish to find them again.
+    private var picks: [SpeakerPick] {
+        Dictionary(grouping: pinned, by: \.value).sorted { $0.key < $1.key }.map { name, clusters in
+            let ids = Set(clusters.map(\.key))
+            return SpeakerPick(name: name, spans: turns.filter { ids.contains($0.speaker) }.map { [$0.start, $0.end] })
+        }
     }
 
     private func writeManifest() {
         let m = manifest
         guard m.title != manifestWritten?.title || m.origin != manifestWritten?.origin || m.discard != manifestWritten?.discard
                 || m.language != manifestWritten?.language || m.notes != manifestWritten?.notes
-                || m.speakerHints.count != manifestWritten?.speakerHints.count else { return }
+                || m.speakerHints.count != manifestWritten?.speakerHints.count || m.speakerPicks != manifestWritten?.speakerPicks else { return }
         m.write(to: folder)
         manifestWritten = m
     }
@@ -537,7 +601,8 @@ final class MeetingSession {
                         lines: lines, hypotheses: hypotheses, capturingMic: micSink != nil,
                         notes: notes, warning: warning, readingCaptions: observer?.active ?? false,
                         captionsNeedAccess: captionsNeedAccess, stopping: isStopping, context: context,
-                        selfMuted: selfMuted && Settings.respectMute && micSink != nil, kept: kept)
+                        selfMuted: selfMuted && Settings.respectMute && micSink != nil, captionsOff: meetStatus.captionsOff,
+                        meetHealth: Settings.meetHealthWarnings ? meetStatus.health : nil, kept: kept, skippedSpeakers: skippedSpeakers)
     }
 
     var othersLabel: String { Settings.participantsName }
@@ -554,6 +619,7 @@ final class MeetingSession {
         streams = [LiveStream(id: "app", speaker: othersLabel, sink: othersSink, session: self)]
         if let micSink { streams.append(LiveStream(id: "mic", speaker: Settings.myName, sink: micSink, session: self)) }
         streams.forEach { $0.start() }
+        MeetingController.shared.sessionActive(true)
         if Settings.diarizeMeetings { scheduleDiarization() }
         startObserver()
         // Unsaved sessions (Live Captions) get a manifest too, so recovery deletes their WAVs after a crash.
@@ -599,9 +665,14 @@ final class MeetingSession {
         tap.stop()
         mic?.stop()
         for s in streams { await s.finish() }
+        await MeetingController.shared.sessionActive(false).value
         closeFiles()
         hypotheses = [:]
-        if diarize, Settings.diarizeMeetings { await diarizeNow(live: false) }
+        if diarize, Settings.diarizeMeetings {
+            await diarizeNow(live: false)
+            // No polish follows to learn them: remember the voices the user named now.
+            if Settings.rememberVoices { for (id, name) in pinned { if let v = liveVoices[id] { Store.shared.learnVoice(name, v) } } }
+        }
         lines.sort { $0.start < $1.start }
         let segments = SpeakerPipeline.merge(lines)
         let recorded = Double(max(othersSink.total, micSink?.total ?? 0)) / SampleSink.rate
@@ -631,10 +702,10 @@ final class MeetingSession {
         MeetObserver.requestTrust()
         let origin = othersSink.origin ?? mach_absolute_time()
         guard let o = MeetObserver(bundleID: meetBundle, clock: { HostTime.seconds(from: origin, to: HostTime.now) }) else { return }
-        let mic = micSink
+        let gate = MuteGate(micSink)
         o.onSelfMute = { [weak self] muted in
             // Straight from the observer's thread: every millisecond of a mute is blanked.
-            if Settings.respectMute { mic?.gate(muted: muted) }
+            if Settings.respectMute { gate.set(muted) }
             Task { @MainActor in self?.selfMuteChanged(muted) }
         }
         o.onEnded = { [weak self] in
@@ -651,10 +722,23 @@ final class MeetingSession {
                 self.hints.append(SpeakerHint(time: self.now, name: name))
             }
         }
+        o.autoEnableCaptions = Settings.autoEnableCaptions
         observer = o
-        if Settings.respectMute, MeetObserver.trusted { holdMic() }
+        if PreJoinWatcher.shared.takeWebTree(meetBundle) { o.adoptWebTree() }
+        if Settings.respectMute, MeetObserver.trusted {
+            holdMic()
+            // You may have joined muted: nothing is recorded until the page says, for up to 5 s.
+            gate.closeUntilRead(seconds: 5)
+        }
         o.start()
         contextChanged()
+    }
+
+    /// The pre-join watcher's page tree for this session's browser: the observer switches it off when it stops.
+    func adoptWebTree(_ bundle: String) -> Bool {
+        guard bundle == meetBundle, let observer else { return false }
+        observer.adoptWebTree()
+        return true
     }
 
     /// The mic track runs 0.75 s behind, so a mute also blanks the words just before it was noticed.
@@ -684,7 +768,12 @@ final class MeetingSession {
         }
         c.calendar = c.calendar ?? calendar
         if Settings.respectMute, observer.active { holdMic() }
-        if Settings.followMeetingLanguage, let code = c.captionLanguage.flatMap(MeetingController.languageCode), code != captionLanguage {
+        let status = observer.status
+        if status != meetStatus {
+            meetStatus = status
+            publish()
+        }
+        if Settings.followMeetingLanguage, !languagePinned, let code = c.captionLanguage.flatMap(MeetingController.languageCode), code != captionLanguage {
             captionLanguage = code
             if code != language.flatMap(MeetingController.languageCode) {
                 LiveDebug.log("[meet] caption language \(code): live passes switch to it")
@@ -860,16 +949,18 @@ final class MeetingSession {
         guard let result = try? await Engine.shared.diarizeDetailed(samples: samples, speakers: bounds), !(live && Task.isCancelled) else { return }
         let (newTurns, embeddings) = stabilised(Engine.clean(result, bounded: bounds != nil))
         turns = newTurns
+        liveVoices = embeddings
         if Settings.autoNameSpeakers {
             var names = context.map { SpeakerPipeline.fromCaptions(turns: newTurns, context: $0, words: liveWords) } ?? [:]
             let hinted = SpeakerNaming.fromHints(turns: newTurns.filter { names[$0.speaker] == nil }, hints: hints)
             names.merge(hinted.filter { !names.values.contains($0.value) }) { a, _ in a }
             if Settings.rememberVoices {
                 let unnamed = embeddings.filter { names[$0.key] == nil }
-                names.merge(SpeakerNaming.fromVoices(unnamed, known: Store.shared.voices(), taken: Set(names.values))) { a, _ in a }
+                names.merge(SpeakerNaming.fromVoices(unnamed, known: Store.shared.voices(), taken: Set(names.values).union(pinned.values))) { a, _ in a }
             }
             speakerNames = names
         }
+        if !pinned.isEmpty { writeManifest() }
         var revised = 0
         var labels = lines.map(\.speaker)
         for i in lines.indices where !isMine(lines[i]) { labels[i] = speakerLabel(at: lines[i]) ?? labels[i] }
@@ -928,6 +1019,25 @@ final class MeetingSession {
         return (turns, embeddings)
     }
 
+    /// "Who is this?" in the panel: `label` ("Speaker 2") is `name` from now on, in the lines on screen, in later passes
+    /// and at polish. Naming two labels alike makes them one person.
+    func nameSpeaker(_ label: String, _ name: String) {
+        guard let n = Int(label.dropFirst("Speaker ".count)), SpeakerPicker.isUnnamed(label),
+              let cluster = speakerNumbers.first(where: { $0.value == n })?.key else { return }
+        pinned[cluster] = name
+        speakerNames[cluster] = nil
+        for i in lines.indices where lines[i].speaker == label { lines[i].speaker = name }
+        LiveDebug.log("[speakers] named a voice (\(label))")
+        EventBus.shared.publish("meeting.speaker_named", ["meeting_id": id, "speaker": label, "name": name])
+        writeManifest()
+        publish()
+    }
+
+    func skipSpeaker(_ label: String) {
+        guard skippedSpeakers.insert(label).inserted else { return }
+        publish()
+    }
+
     private func speakerLabel(at line: Segment) -> String? {
         var overlap: [String: Double] = [:]
         for t in turns {
@@ -935,7 +1045,7 @@ final class MeetingSession {
             if o > 0 { overlap[t.speaker, default: 0] += o }
         }
         guard let best = overlap.max(by: { $0.value < $1.value })?.key else { return nil }
-        if let name = speakerNames[best] { return name }
+        if let name = pinned[best] ?? speakerNames[best] { return name }
         if speakerNumbers[best] == nil { speakerNumbers[best] = speakerNumbers.count + 1 }
         return "Speaker \(speakerNumbers[best]!)"
     }
@@ -980,6 +1090,8 @@ final class LiveStream {
     private var retryAt = Date.distantPast
     /// End of the last Whisper pass (passes are spaced from there, leaving the engine to the other stream).
     private var whisperPassAt = Date.distantPast
+    /// The window waits, undecoded, for more speech (a session's first words on Whisper).
+    private var held = false
 
     init(id: String, speaker: String, sink: SampleSink, session: MeetingSession) {
         self.id = id
@@ -1012,7 +1124,7 @@ final class LiveStream {
     }
 
     private func pass(final: Bool) async {
-        let language = session?.language
+        let language = session?.language, context = session?.context
         let whisper = Engine.usesWhisper(language: language) ? await Engine.shared.liveUsesWhisper(language) : false
         if whisper, !final, Date().timeIntervalSince(whisperPassAt) < Self.whisperInterval { return }
         let rate = SampleSink.rate
@@ -1033,10 +1145,11 @@ final class LiveStream {
         let newVoice = activity.suffix(newFrames).contains(true)
         let trailingSilence = Double(activity.reversed().prefix { !$0 }.count) * 0.1
         let anyVoice = activity.contains(true)
-        let hasPending = !previous.isEmpty || !openLine.isEmpty
+        let hasPending = !previous.isEmpty || !openLine.isEmpty || held
         let endpoint = trailingSilence >= Self.endpointAfter || (!anyVoice && hasPending && seconds >= Self.endpointAfter)
         let cap = whisper ? Self.whisperWindow : Self.forcePassAfter
         let force = seconds >= cap
+        let closing = final || endpoint || force
 
         if !anyVoice && !hasPending {
             // Silence only: nothing to transcribe; keep a short lead-in.
@@ -1050,11 +1163,13 @@ final class LiveStream {
 
         lastPassTotal = total
         let windowStart = Double(pendingStart) / rate
-        let result: (words: [LiveWord], language: String?)
+        let result: (words: [LiveWord], language: String?, decoded: Bool)
         do {
             defer { if whisper { whisperPassAt = Date() } }
-            result = try await Engine.shared.transcribeStream(window, language: language, whisper: whisper)
+            result = try await Engine.shared.transcribeStream(window, language: language, whisper: whisper, context: context, at: windowStart,
+                                                              session: session?.id, closing: closing, mic: id == "mic")
         } catch {
+            held = false
             failures += 1
             retryAt = Date().addingTimeInterval(min(60, 5 * pow(2, Double(min(failures, 5) - 1))))
             previous = []
@@ -1067,6 +1182,9 @@ final class LiveStream {
             failures = 0
             session?.speechModelRecovered()
         }
+        // Too little speech yet: the window stays, to be decoded with what follows or once it closes.
+        held = !result.decoded
+        if held { return }
         if session?.language == nil, let l = result.language { session?.language = l }
         session?.liveModel = whisper ? Engine.whisperID : Engine.modelID
 
@@ -1084,7 +1202,6 @@ final class LiveStream {
         defer {
             LiveDebug.log("[\(id)] t=\(String(format: "%.2f", Double(total) / rate)) win=\(String(format: "%.2f", seconds)) start=\(String(format: "%.2f", windowStart)) conf=\(String(format: "%.2f", confirmedUntil)) endpoint=\(endpoint) final=\(final) prev=\(previous.count) words=\(words.map { "\($0.text.trimmingCharacters(in: .whitespaces))@\(String(format: "%.2f", $0.start))" }.joined(separator: " ")) confirm=\(confirmCount)")
         }
-        let closing = final || endpoint || force
         if closing {
             confirmCount = words.count
             // Whisper's capped window: keep the last second open, its word may be cut off.
@@ -1253,6 +1370,26 @@ enum LiveDebug {
         let data = Data((line + "\n").utf8)
         if let h = try? FileHandle(forWritingTo: url) { h.seekToEndOfFile(); h.write(data); try? h.close() }
         else { try? data.write(to: url) }
+    }
+}
+
+/// Respect mute's gate on the mic track, from the observer's thread. Closed until the first read of your mute state;
+/// open again if none comes within the timeout, so a page that can't be read doesn't silence you for good.
+private final class MuteGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var known = false
+    private let sink: SampleSink?
+
+    init(_ sink: SampleSink?) { self.sink = sink }
+
+    func set(_ muted: Bool) { lock.withLock { known = true; sink?.gate(muted: muted) } }
+
+    func closeUntilRead(seconds: Double) {
+        guard sink != nil else { return }
+        lock.withLock { if !known { sink?.gate(muted: true) } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + seconds) { [self] in
+            lock.withLock { if !known { known = true; sink?.gate(muted: false) } }
+        }
     }
 }
 

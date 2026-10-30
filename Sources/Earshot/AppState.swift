@@ -1,4 +1,6 @@
+import AVFoundation
 import AppKit
+import ApplicationServices
 import Observation
 import ServiceManagement
 import SwiftUI
@@ -20,11 +22,37 @@ final class AppState {
     var modelBytes: [String: Int64] = [:]
     var downloads: [String: Double] = [:]
     var recordingStarted: Date?
-    var transcripts: [Transcript] = []
+    var transcripts: [Transcript] = [] {
+        didSet {
+            let groups = Series.groups(transcripts)
+            if groups != seriesGroups { seriesGroups = groups }
+        }
+    }
+    /// Recurring meetings: series key → meeting ids, newest first (see `Series`).
+    private(set) var seriesGroups: [String: [String]] = [:]
     var activeJobs = 0
     var lastError: String?
-    var meeting: MeetingSnapshot?
+    var meeting: MeetingSnapshot? {
+        didSet {
+            if let meeting { noteWarnings(meeting) }
+            refreshLivePrompt()
+        }
+    }
+    /// The live panel's "Who is this?" for the running meeting: worked out at most every 5 s, off the main actor, and
+    /// held still while the user is using it.
+    private(set) var livePrompt: SpeakerPicker.Prompt?
+    @ObservationIgnored private var livePromptAt = Date.distantPast
+    @ObservationIgnored private var livePromptTask: Task<Void, Never>?
+    @ObservationIgnored private var livePromptHeld = false
+    /// Meet hints the user closed, per meeting id ("captions", or the health message).
+    var dismissedHints: [String: Set<String>] = [:]
     var detectedMeeting: DetectedMeeting?
+    /// A Meet tab on its pre-join screen: the panel offers the language and what to record.
+    var preJoin: PreJoinOffer?
+    var showsPreJoin: Bool { preJoin.map { !$0.dismissed } ?? false }
+    /// Unnamed voices the user skipped in a transcript's "Who is this?" prompt, per transcript id.
+    var skippedSpeakers: [String: Set<String>] = (UserDefaults.standard.dictionary(forKey: "skippedSpeakers") as? [String: [String]] ?? [:])
+        .mapValues(Set.init)
     /// Auto-stop countdown after the meeting app released the mic.
     var stoppingAt: Date?
     /// Meetings being re-transcribed after Stop (or by hand).
@@ -97,14 +125,77 @@ final class AppState {
         reloadTranscripts()
         refreshModelStatus()
         refreshLaunchAtLogin()
+        checkGrants(launch: true)
         NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
-            MainActor.assumeIsolated { AppState.shared.refreshLaunchAtLogin() }
+            MainActor.assumeIsolated {
+                AppState.shared.refreshLaunchAtLogin()
+                AppState.shared.checkGrants(launch: false)
+            }
         }
         BookmarkHotkey.shared.update()
         Task { await Jobs.shared.restore() }
         Task { await MeetingRecovery.run() }
+        AudioRetention.schedule()
         // First launch after install: download the speech models (≈ 525 MB).
         Task { await Engine.shared.prepareSpeechModels() }
+    }
+
+    // MARK: Permissions after an update
+
+    enum Grant: String, CaseIterable { case microphone, accessibility }
+
+    /// Permissions an update took away (releases are ad hoc signed, so macOS sees each one as a new app); the Overview
+    /// asks for them again until they're back or dismissed.
+    private(set) var lostGrants: [Grant] = []
+
+    static func granted() -> Set<Grant> {
+        var g: Set<Grant> = []
+        if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized { g.insert(.microphone) }
+        if AXIsProcessTrusted() { g.insert(.accessibility) }
+        return g
+    }
+
+    /// `launch`: the first launch of a new build compares with what the last build had (or, from a build that didn't
+    /// record it, with everything Earshot uses).
+    func checkGrants(launch: Bool) {
+        let d = UserDefaults.standard, now = Self.granted()
+        func grants(_ key: String) -> Set<Grant> { Set((d.stringArray(forKey: key) ?? []).compactMap(Grant.init)) }
+        if launch {
+            let last = d.string(forKey: "grantsBuild") ?? d.string(forKey: "askedAccessibilityBuild")
+            if let last, last != Settings.appBuild {
+                let before = d.object(forKey: "grants") != nil ? grants("grants") : Set(Grant.allCases)
+                d.set(before.subtracting(now).map(\.rawValue), forKey: "grantsLost")
+            }
+            d.set(Settings.appBuild, forKey: "grantsBuild")
+        }
+        d.set(now.map(\.rawValue), forKey: "grants")
+        let lost = grants("grantsLost").subtracting(now)
+        d.set(lost.map(\.rawValue), forKey: "grantsLost")
+        let list = Grant.allCases.filter(lost.contains)
+        if list != lostGrants { lostGrants = list }
+    }
+
+    func dismissLostGrants() {
+        UserDefaults.standard.removeObject(forKey: "grantsLost")
+        lostGrants = []
+    }
+
+    /// Asks again where macOS can (a microphone that's "not asked yet"), else opens the System Settings pane.
+    func restoreGrant(_ g: Grant) {
+        switch g {
+        case .microphone:
+            if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
+                AVCaptureDevice.requestAccess(for: .audio) { _ in Task { @MainActor in AppState.shared.checkGrants(launch: false) } }
+            } else {
+                Self.openPrivacyPane("Privacy_Microphone")
+            }
+        case .accessibility:
+            MeetObserver.ask()
+        }
+    }
+
+    static func openPrivacyPane(_ anchor: String) {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)") { NSWorkspace.shared.open(url) }
     }
 
     @ObservationIgnored private var modelScan = 0
@@ -245,6 +336,8 @@ final class AppState {
     // MARK: Library
 
     @ObservationIgnored private var libraryLoad = 0
+    /// Bumped by every library reload (views that read files, like a transcript's audio, look again).
+    private(set) var libraryVersion = 0
     @ObservationIgnored private var libraryLoading = false
 
     /// Reads the whole library off the main actor; a newer reload supersedes an older one still running.
@@ -259,6 +352,7 @@ final class AppState {
             }.value
             guard load == libraryLoad else { return }
             libraryLoading = false
+            libraryVersion += 1
             transcripts = active
             deleted = trash
             self.folders = folders
@@ -334,6 +428,21 @@ final class AppState {
     func deletePerson(_ p: Person) {
         Store.shared.deletePerson(p.id)
         reloadLibrary()
+    }
+
+    /// "Who is this?": names a speaker throughout one transcript, adds them to People and, for meetings, remembers
+    /// the voice. A name another speaker already has merges the two (one person split in two).
+    func nameSpeaker(in t: Transcript, from old: String?, to new: String) {
+        let name = new.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name != old else { return }
+        addPerson(name)
+        renameSpeaker(in: t, from: old, to: name)
+    }
+
+    func skipSpeaker(_ label: String, in id: String) {
+        skippedSpeakers[id, default: []].insert(label)
+        if skippedSpeakers.count > 200, let old = skippedSpeakers.keys.first(where: { $0 != id }) { skippedSpeakers[old] = nil }
+        UserDefaults.standard.set(skippedSpeakers.mapValues { Array($0).sorted() }, forKey: "skippedSpeakers")
     }
 
     /// Assign a person to a speaker label throughout one transcript.
@@ -430,6 +539,37 @@ final class AppState {
 
     func reloadTranscripts() { reloadLibrary() }
 
+    // MARK: Meet hints and warnings
+
+    func dismissHint(_ hint: String, in meetingID: String) { dismissedHints[meetingID, default: []].insert(hint) }
+
+    func showsHint(_ hint: String, in m: MeetingSnapshot) -> Bool {
+        Settings.meetHealthWarnings && !m.stopping && !(dismissedHints[m.id]?.contains(hint) ?? false)
+    }
+
+    nonisolated static let warningsKey = "lastMeetingWarnings"
+    nonisolated static let captionsWarning = "Captions are off in Meet"
+    @ObservationIgnored private var warningsMeeting: String?
+    @ObservationIgnored private var warningsSeen: [String] = []
+
+    /// Every warning of the latest meeting, kept (without the title) for Copy Diagnostics.
+    private func noteWarnings(_ m: MeetingSnapshot) {
+        if warningsMeeting != m.id {
+            warningsMeeting = m.id
+            warningsSeen = []
+            UserDefaults.standard.set([String](), forKey: Self.warningsKey)
+        }
+        // The captions reminder is one-time: once captions come back on it stays closed for this meeting.
+        if !m.captionsOff, warningsSeen.contains(Self.captionsWarning), !(dismissedHints[m.id]?.contains("captions") ?? false) {
+            dismissHint("captions", in: m.id)
+        }
+        let now = [m.warning, m.meetHealth, m.captionsOff ? Self.captionsWarning : nil, m.captionsNeedAccess ? "Captions need Accessibility access" : nil]
+            .compactMap { $0 }.filter { !warningsSeen.contains($0) }
+        guard !now.isEmpty else { return }
+        warningsSeen += now
+        UserDefaults.standard.set(Array(warningsSeen.suffix(20)), forKey: Self.warningsKey)
+    }
+
 
     /// A saved transcript lands in the list matching its trash state.
     func didSave(_ t: Transcript) {
@@ -525,7 +665,50 @@ final class AppState {
     func ignoreDetected() {
         if let d = detectedMeeting { MeetingDetector.shared.ignore(d) }
         detectedMeeting = nil
-        MeetingPanel.shared.hide()
+        if !showsPreJoin { MeetingPanel.shared.hide() }
+    }
+
+    /// Names a live "Speaker N": applied to the lines on screen, to later passes and at polish.
+    func nameLiveSpeaker(_ label: String, _ name: String) {
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        addPerson(name)
+        MeetingController.shared.session?.nameSpeaker(label, name)
+    }
+
+    func skipLiveSpeaker(_ label: String) { MeetingController.shared.session?.skipSpeaker(label) }
+
+    /// Typing a name or pointing at a chip: the prompt doesn't change under the user (a name landing on another voice).
+    func holdLivePrompt(_ held: Bool) {
+        guard held != livePromptHeld else { return }
+        livePromptHeld = held
+        if !held { refreshLivePrompt() }
+    }
+
+    private func refreshLivePrompt() {
+        guard let m = meeting, !m.stopping else {
+            if livePrompt != nil { livePrompt = nil }
+            livePromptHeld = false
+            return
+        }
+        // Named or skipped: it goes at once (a held prompt too, the user just answered it).
+        if let p = livePrompt, m.skippedSpeakers.contains(p.label) || !m.lines.contains(where: { $0.speaker == p.label }) {
+            livePrompt = nil
+            livePromptHeld = false
+        }
+        guard !livePromptHeld, livePromptTask == nil else { return }
+        let wait = max(0, 5 - Date().timeIntervalSince(livePromptAt))
+        livePromptTask = Task { @MainActor [weak self] in
+            if wait > 0 { try? await Task.sleep(for: .seconds(wait)) }
+            guard let self else { return }
+            defer { self.livePromptTask = nil }
+            guard let m = self.meeting, !m.stopping, !self.livePromptHeld else { return }
+            self.livePromptAt = Date()
+            let (lines, context, skipped) = (m.lines, m.context, m.skippedSpeakers)
+            let p = await Task.detached(priority: .utility) { SpeakerPicker.livePrompt(lines: lines, context: context, skipped: skipped) }.value
+            guard self.meeting?.id == m.id, !self.livePromptHeld, p != self.livePrompt else { return }
+            self.livePrompt = p
+        }
     }
 
     func importURL(_ link: String) {
