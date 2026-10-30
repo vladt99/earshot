@@ -176,17 +176,21 @@ running as usual. Meetings were recorded with the microphone on and speaker labe
 
 | Scenario | CPU average | CPU p95 | Memory average | Memory peak | Time |
 |---|---|---|---|---|---|
-| Idle in the menu bar, Whisper loaded | 0 % | 0 % | 1.7 GB | 1.7 GB | |
+| Idle in the menu bar, Whisper loaded | 0 % | 0 % | 1.7 GB | 1.7 GB | (0.12 unloads it after 10 idle minutes) |
 | Live meeting: app audio + microphone, live transcript every ~2 s, speaker labels | 67 % | 85 % | 1.8 GB | 2.2 GB | real time |
 | Polishing the saved 3-minute meeting | 60 % | | | 2.9 GB | 70 s |
-| Polishing a saved 22-minute meeting | | | | | 7 min |
+| Polishing a saved 22-minute meeting | | | | | 7 min (0.9; see below) |
 | File transcription, 5 minutes | | | | | 16 s (19× real time) |
+
+Since 0.12 the Whisper final pass decodes only speech (muted and silent stretches are skipped), which cut a
+22-minute meeting's Whisper time from about 6.5 to 1.5 minutes in testing. The tables will be re-measured on 0.12.
 
 - CPU is a percentage of one core, as in Activity Monitor: 85 % is less than a tenth of this 12-core Mac.
 - Parakeet runs mostly on the Neural Engine and Whisper's encoder on the GPU; these CPU figures don't include them.
-- Whisper keeps about 1.5 GB in memory while a non-English language is selected. With English, memory drops back to
-  about 200 MB after a meeting.
-- Recording uses about 30 MB of disk per 8.5 minutes (two 16 kHz tracks), roughly 220 MB per hour.
+- Whisper takes about 1.5 GB of memory while loaded. Since 0.12 it loads on Meet's pre-join screen and unloads after
+  10 minutes without a meeting. With English, memory drops back to about 200 MB after a meeting.
+- Recording uses about 220 MB of disk per hour while the meeting runs (two 16 kHz WAV tracks); once the transcript is
+  done it's compressed to AAC, about 27 MB per hour.
 - Live speaker labels are recomputed less often as a meeting grows, so long meetings don't slow the live transcript.
   Meetings of several hours haven't been measured yet.
 
