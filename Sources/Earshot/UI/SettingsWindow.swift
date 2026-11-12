@@ -354,6 +354,14 @@ private struct SettingsPage: View {
                 }
                 note("Live meeting events as Server-Sent Events: GET /v1/events?filter=meeting. Full reference in the README.")
             }
+            GlassGroup(title: "Chrome extension (Google Meet)") {
+                note("Keeps reading Meet's captions while the Meet tab is in the background, so speakers stay named. Works in Chrome, Edge, Brave and Arc.")
+                HStack {
+                    Button("Show Extension Folder") { ChromeExtension.reveal() }.buttonStyle(.glass)
+                    Button("Copy Extension Token") { state.copy(API.browserToken) }.buttonStyle(.glass)
+                }
+                note("In chrome://extensions turn on Developer mode, click Load unpacked and pick the folder. Then paste the token in the extension's options. The token only lets the extension send captions.")
+            }
             WebhookSettings()
             GlassGroup(title: "MCP server (Claude Code, Claude Desktop)") {
                 let command = (Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("earshot-mcp").path) ?? "earshot-mcp"
@@ -426,6 +434,8 @@ private struct MeetingSettings: View {
         GlassGroup(title: "During calls") {
             row("Use the meeting's caption language", Settings.followMeetingLanguage) { Settings.followMeetingLanguage = $0 }
             explain("When Google Meet's captions are set to another language, the meeting is transcribed in that language instead of the one picked in Earshot.")
+            row("Set Meet's caption language automatically", Settings.autoCaptionLanguage) { Settings.autoCaptionLanguage = $0 }
+            explain("Switches Meet's captions to the language picked for the meeting or remembered for its series. Otherwise Earshot listens to the first 15 seconds of speech and switches to the language it hears (needs Whisper). Once per call; a change you make in Meet wins.")
             row("Don't record my microphone while I'm muted", Settings.respectMute) { Settings.respectMute = $0 }
             explain("While you're muted in the meeting app, silence is recorded instead of your microphone, so side conversations stay out of the transcript.")
             row("Save Live Captions of calls as meetings", Settings.keepLiveCaptionsOfCalls) { Settings.keepLiveCaptionsOfCalls = $0 }
@@ -801,5 +811,23 @@ private struct DiagnosticsSettings: View {
                 if copied { Label("Copied", systemImage: "checkmark").font(.callout).foregroundStyle(.green) }
             }
         }
+    }
+}
+
+/// The bundled Chrome extension, copied to Application Support so its folder (and Chrome's ID for it) survives updates.
+enum ChromeExtension {
+    static var folder: URL { Paths.support.appendingPathComponent("ChromeExtension", isDirectory: true) }
+
+    static func reveal() {
+        let fm = FileManager.default
+        if let src = Bundle.main.resourceURL?.appendingPathComponent("ChromeExtension"), fm.fileExists(atPath: src.path) {
+            try? fm.createDirectory(at: folder, withIntermediateDirectories: true)
+            for name in (try? fm.contentsOfDirectory(atPath: src.path)) ?? [] {
+                let to = folder.appendingPathComponent(name)
+                try? fm.removeItem(at: to)
+                try? fm.copyItem(at: src.appendingPathComponent(name), to: to)
+            }
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([folder])
     }
 }

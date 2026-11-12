@@ -147,6 +147,13 @@ enum Settings {
         set { d.set(newValue, forKey: "followMeetingLanguage") }
     }
 
+    /// Set Google Meet's caption language for you: the language remembered for the meeting or its series, or else the
+    /// one Earshot hears spoken.
+    static var autoCaptionLanguage: Bool {
+        get { d.object(forKey: "autoCaptionLanguage") as? Bool ?? true }
+        set { d.set(newValue, forKey: "autoCaptionLanguage") }
+    }
+
     /// Write silence instead of your microphone while you're muted in the meeting app.
     static var respectMute: Bool {
         get { d.object(forKey: "respectMute") as? Bool ?? true }

@@ -300,6 +300,20 @@ actor Engine {
         return whisper != nil
     }
 
+    /// The language spoken in `samples` (Whisper's language ID over the first 30 s) and its probability among all
+    /// languages. nil when Whisper isn't installed (it is never downloaded for this) or can't tell.
+    func spokenLanguage(_ samples: [Float]) async -> (code: String, probability: Double)? {
+        guard ModelCatalog.isInstalled(ModelCatalog.whisper) else { return nil }
+        whisperBusy += 1
+        defer { whisperBusy -= 1; whisperUsedAt = Date() }
+        guard let kit = try? await loadWhisper(priority: .utility).value else { return nil }
+        await acquire(live: true)
+        let r = try? await kit.detectLangauge(audioArray: Array(samples.prefix(Int(SampleSink.rate * 30))))
+        release()
+        guard let r, let logProb = r.langProbs[r.language] else { return nil }
+        return (r.language, Double(exp(logProb)))
+    }
+
     private func loadWhisper(priority: TaskPriority? = nil) -> Task<WhisperKit, Error> {
         if let whisperLoad { return whisperLoad }
         if let whisper { return Task { whisper } }

@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Earshot for Google Meet</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 13px -apple-system, system-ui, sans-serif; margin: 16px; min-width: 320px; }
+  h1 { font-size: 15px; margin: 0 0 8px; }
+  label { display: block; margin: 10px 0 4px; font-weight: 600; }
+  input { width: 100%; box-sizing: border-box; padding: 6px; font: 12px ui-monospace, monospace; }
+  button { margin-top: 12px; padding: 6px 14px; }
+  p { color: GrayText; margin: 6px 0; }
+  #status { margin-top: 12px; }
+</style>
+</head>
+<body>
+<h1>Earshot for Google Meet</h1>
+<p>Sends Meet's captions to Earshot on this Mac while the Meet tab is in the background. Turn on captions (CC) in Meet.</p>
+<label for="token">Extension token</label>
+<input id="token" type="password" placeholder="Earshot → Settings → Integrations → Copy Extension Token">
+<label for="port">Earshot API port</label>
+<input id="port" type="number" min="1" max="65535" placeholder="7788">
+<button id="save">Save</button>
+<div id="status"></div>
+<script src="options.js"></script>
+</body>
+</html>

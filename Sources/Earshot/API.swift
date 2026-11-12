@@ -5,10 +5,13 @@ import Security
 /// The token and base URL are published in ~/Library/Application Support/Earshot/api.json.
 enum API {
     static var token = ""
+    /// The browser extension's token: good for posting Meet captions only.
+    static var browserToken = ""
     private static var server: HTTPServer?
 
     static func start() {
         token = loadOrCreateToken()
+        browserToken = loadOrCreateToken(key: "browser_token")
         let port = Settings.port
         let server = HTTPServer(port: port, admit: admit) { await handle($0) }
         do {
@@ -28,6 +31,7 @@ enum API {
 
     // MARK: - Routing
 
+    static let captionsRoute = ["v1", "meet", "captions"]
     private static let uploadRoutes: Set<[String]> = [["v1", "audio", "transcriptions"], ["v1", "audio", "translations"], ["v1", "jobs"]]
 
     /// Runs on the headers alone, so strangers never get a 100 Continue or a buffered body.
@@ -35,6 +39,20 @@ enum API {
         // DNS-rebinding and drive-by protection: only loopback hosts, never browser pages.
         guard ["127.0.0.1", "localhost", "[::1]", ""].contains(hostName(req.headers["host"] ?? "")) else {
             return .reject(.error(403, "Host not allowed"))
+        }
+        // The Earshot browser extension: only its own route, only with its own token. Web pages can't claim an
+        // extension origin.
+        let route = req.path.split(separator: "/").map(String.init)
+        if route == captionsRoute, let origin = req.headers["origin"] {
+            guard req.method == "POST", origin.lowercased().hasPrefix("chrome-extension://") else {
+                return .reject(.error(403, "Browser origins are not allowed"))
+            }
+            let auth = req.headers["authorization"] ?? ""
+            let presented = auth.lowercased().hasPrefix("bearer ") ? String(auth.dropFirst(7)) : ""
+            guard !presented.isEmpty, constantTimeEquals(presented, browserToken) else {
+                return .reject(.error(401, "Missing or invalid extension token. Copy it from Earshot → Settings → Integrations."))
+            }
+            return .accept(maxBody: HTTPServer.smallBody, stream: false)
         }
         // Local tools send neither; browsers always send one or the other (including "Origin: null").
         if req.headers["origin"] != nil { return .reject(.error(403, "Browser origins are not allowed")) }
@@ -68,6 +86,7 @@ enum API {
         do {
             switch (req.method, parts) {
             case ("GET", ["v1", "status"]): return await status()
+            case ("POST", captionsRoute): return await meetCaptions(req)
 
             case ("GET", ["v1", "models"]): return models()
             case ("POST", ["v1", "models", "download"]): return try await download(req)
@@ -247,6 +266,29 @@ enum API {
 
     // MARK: - Handlers
 
+    /// Captions from the browser extension: {"code": "abc-defg-hij", "page": "<random per page load>",
+    /// "blocks": [{"id": 3, "speaker": "Ana", "text": "…"}]}, oldest block first, as Meet shows them now.
+    private static func meetCaptions(_ req: HTTPRequest) async -> HTTPResponse {
+        let body = req.jsonObject
+        guard let raw = body["blocks"] as? [[String: Any]] else { return .error(400, "Body must be {\"code\", \"page\", \"blocks\": [{\"id\", \"speaker\", \"text\"}]}") }
+        let page = body["page"] as? String ?? ""
+        let code = (body["code"] as? String).flatMap { MeetObserver.meetCode("https://meet.google.com/\($0)") }
+        let blocks = raw.suffix(MeetObserver.captionTail).compactMap { b -> MeetCaptionBlock? in
+            guard let id = (b["id"] as? NSNumber)?.intValue, let speaker = b["speaker"] as? String, let text = b["text"] as? String else { return nil }
+            var h = Hasher()
+            h.combine("browser")
+            h.combine(page)
+            h.combine(id)
+            return MeetCaptionBlock(key: h.finalize(), speaker: String(speaker.prefix(200)),
+                                    text: MeetParse.clean(String(text.suffix(4000))))
+        }
+        let result = await MainActor.run { () -> (recording: Bool, accepted: Bool) in
+            guard let s = MeetingController.shared.session else { return (false, false) }
+            return (true, s.browserCaptions(blocks, code: code))
+        }
+        return .json(["recording": result.recording, "accepted": result.accepted])
+    }
+
     private static func health() async -> HTTPResponse {
         let loaded = await Engine.shared.loadedModel
         return .json(["ok": true, "name": "Earshot", "version": appVersion, "loaded_model": (loaded as Any?) ?? NSNull()])
@@ -374,10 +416,10 @@ enum API {
         return zip(x, y).reduce(0) { $0 | ($1.0 ^ $1.1) } == 0
     }
 
-    private static func loadOrCreateToken() -> String {
+    private static func loadOrCreateToken(key: String = "token") -> String {
         if let data = try? Data(contentsOf: Paths.apiInfo),
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let t = obj["token"] as? String, t.count >= 32 { return t }
+           let t = obj[key] as? String, t.count >= 32 { return t }
         return randomHex(32)
     }
 
@@ -391,7 +433,7 @@ enum API {
     }
 
     private static func writeInfo(port: UInt16) {
-        let info: [String: Any] = ["base_url": "http://127.0.0.1:\(port)", "port": Int(port), "token": token,
+        let info: [String: Any] = ["base_url": "http://127.0.0.1:\(port)", "port": Int(port), "token": token, "browser_token": browserToken,
                                    "version": appVersion, "pid": Int(ProcessInfo.processInfo.processIdentifier)]
         guard let data = try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]) else { return }
         // Created 0600 from the start (no umask window), then renamed into place.

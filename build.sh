@@ -53,6 +53,8 @@ if [[ -d Resources/Assets.xcassets ]]; then
 fi
 # SwiftPM resource bundles of dependencies
 for b in "$BIN"/*.bundle(N); do cp -R "$b" "$APP/Contents/Resources/"; done
+# The Chrome extension that reads Meet captions from a background tab (Settings copies it out for "Load unpacked").
+cp -R extension "$APP/Contents/Resources/ChromeExtension"
 
 SIGN_IDENTITY=-
 [[ -f .signing.env ]] && source .signing.env

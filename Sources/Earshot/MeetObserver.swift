@@ -201,6 +201,8 @@ struct MeetPage: Sendable {
     var presenting: [String] = []
     var toasts: [MeetToast] = []
     var language: String?
+    /// The "Meeting language" control.
+    var languageIndex: Int?
     var ended = false
     var phase: MeetPhase = .unknown
     /// Captions on or off as Meet's own control (or, failing that, the captions region) says; nil when unknown.
@@ -316,6 +318,36 @@ enum MeetParse {
         if let c = MeetStrings.languages[l] { return c }
         let base = l.split(separator: "(").first.map { $0.trimmingCharacters(in: .whitespaces) } ?? l
         return MeetStrings.languages[base] ?? base.split(separator: " ").first.flatMap { MeetStrings.languages[String($0)] }
+    }
+
+    /// A language name and nothing else: "Română", "English (United States)". Not "English captions are on".
+    static func exactLanguage(_ s: String) -> String? {
+        let l = clean(s).lowercased()
+        if let c = MeetStrings.languages[l] { return c }
+        guard let open = l.firstIndex(of: "("), l.hasSuffix(")") else { return nil }
+        return MeetStrings.languages[l[..<open].trimmingCharacters(in: .whitespaces)]
+    }
+
+    /// In Meet's open language list, the entry for `code`: inside a list or menu (never caption text), pressable roles
+    /// before their text, and for English the plain or US variant before the others. `control` is the list's own
+    /// control, never picked.
+    static func languageOption(_ nodes: [MeetNode], code: String, control: Int?) -> Int? {
+        let lists: Set<String> = ["AXList", "AXMenu", "AXListBox", "AXOutline", "AXTable"]
+        let pressable: Set<String> = ["AXMenuItem", "AXRadioButton", "AXButton", "AXCell", "AXRow", "AXCheckBox"]
+        var path: [String] = [], best: (index: Int, score: Int)?
+        for (i, n) in nodes.enumerated() {
+            path = Array(path.prefix(n.depth))
+            defer { path.append(n.role) }
+            guard i != control, n.role != "AXComboBox", n.role != "AXPopUpButton" else { continue }
+            let name = n.label.isEmpty ? n.text : n.label
+            guard exactLanguage(name) == code else { continue }
+            let listed = path.contains(where: lists.contains) || n.role == "AXMenuItem"
+            guard listed else { continue }
+            let lower = name.lowercased()
+            let score = (pressable.contains(n.role) ? 2 : 0) + (code == "en" && (lower == "english" || lower.contains("united states")) ? 1 : 0)
+            if best.map({ score > $0.score }) ?? true { best = (i, score) }
+        }
+        return best?.index
     }
 
     /// true = muted, from your microphone button's label. Exact match only: the tooltip text
@@ -482,6 +514,7 @@ enum MeetParse {
                 } else if (n.role == "AXComboBox" || n.role == "AXPopUpButton"), MeetStrings.languageControls.contains(label),
                           let v = n.value, let code = language(v) {
                     p.language = code
+                    p.languageIndex = i
                 }
                 if MeetStrings.endTexts.contains(label) { p.ended = true }
                 if n.role == "AXButton" { endButtons.insert(label) }
@@ -535,6 +568,9 @@ struct MeetTracker {
     private var segmentBase: [Int: String] = [:]
     private var closed: Set<Int> = []
     private var captionsSeen = false
+    /// Where the last captions came from, and when the browser extension last sent some.
+    private var captionSource = CaptionSource.page
+    private(set) var feedAt: Double?
     private var selfHand: Bool?
     private var handSeen: [String: Double] = [:]
     private var handUp: Set<String> = []
@@ -773,7 +809,7 @@ struct MeetTracker {
         if let m = p.selfMuted, let c = setMuted(m, at: t) { ch.selfMuted = c }
         if let lang = p.language { context.captionLanguage = lang }
         if firstPageAt == nil { firstPageAt = t }
-        if let blocks = p.captions { ch.speakers = captions(blocks, at: t) }
+        if let blocks = p.captions { ch.speakers = captions(blocks, at: t, from: .page) }
         if p.ended { ch.ended = end(at: t) }
         ch.changed = updateStatus(t) || before != context || ch.selfMuted != nil
         return ch
@@ -818,9 +854,31 @@ struct MeetTracker {
         }
     }
 
+    enum CaptionSource: Sendable { case page, feed }
+    /// The extension counts as sending this long after its last post (it posts at least once a second).
+    static let feedStale = 4.0
+
+    /// The browser extension is sending captions: the page tree's are ignored meanwhile.
+    func feeding(at t: Double) -> Bool { feedAt.map { t - $0 < Self.feedStale } ?? false }
+
+    /// Captions from the Earshot browser extension, which keeps reading while the Meet tab is in the background.
+    mutating func feed(_ blocks: [MeetCaptionBlock], at t: Double) -> Changes {
+        feedAt = t
+        let before = context.captions
+        let speakers = captions(blocks, at: t, from: .feed)
+        return Changes(speakers: speakers, changed: before != context.captions)
+    }
+
     /// Caption blocks as shown now (oldest first). A block grows while its speaker talks; a pause of 2.5 s or 500
     /// characters starts a new turn, and a newer block closes the older ones. Returns who is talking now.
-    mutating func captions(_ blocks: [MeetCaptionBlock], at t: Double) -> [String] {
+    /// Page captions are ignored while the extension feeds them; on a switch of source, the blocks on screen are
+    /// matched to the turns they already started.
+    mutating func captions(_ blocks: [MeetCaptionBlock], at t: Double, from source: CaptionSource = .page) -> [String] {
+        if source == .page, feeding(at: t) { return [] }
+        if source != captionSource {
+            captionSource = source
+            if captionsSeen { adopt(blocks) }
+        }
         var talking: [String] = []
         let first = !captionsSeen
         captionsSeen = true
@@ -860,6 +918,39 @@ struct MeetTracker {
             }
         }
         return talking
+    }
+
+    private func speakerName(_ raw: String) -> (name: String, isSelf: Bool) {
+        let isSelf = MeetParse.isSelf(raw) || raw == selfName
+        return (isSelf ? (selfName ?? "You") : MeetParse.clean(raw), isSelf)
+    }
+
+    /// The other source's keys for blocks already on screen: each takes over the recent turn of the same speaker
+    /// whose text it continues; older unmatched blocks count as already there, the newest stays new.
+    private mutating func adopt(_ blocks: [MeetCaptionBlock]) {
+        var keyOf: [Int: Int] = [:]
+        for (k, i) in turnOf where i >= 0 { keyOf[i] = k }
+        var taken: Set<Int> = []
+        for (pos, b) in blocks.enumerated() where turnOf[b.key] == nil {
+            let speaker = speakerName(b.speaker).name
+            let match = context.captions.indices.suffix(8).reversed().first { i in
+                guard !taken.contains(i), context.captions[i].speaker == speaker, let k = keyOf[i] else { return false }
+                let old = blockText[k] ?? ""
+                return Self.commonPrefix(old, b.text) != nil || old.hasSuffix(b.text) || b.text.hasSuffix(old)
+            }
+            if let i = match, let k = keyOf[i] {
+                taken.insert(i)
+                turnOf[b.key] = i
+                blockText[b.key] = blockText[k]
+                segmentBase[b.key] = segmentBase[k] ?? ""
+                if closed.contains(k) { closed.insert(b.key) }
+                closed.insert(k)
+            } else if pos < blocks.count - 1 {
+                turnOf[b.key] = -1
+                blockText[b.key] = b.text
+                closed.insert(b.key)
+            }
+        }
     }
 
     /// Common prefix cut back to a word boundary; nil if there is none.
@@ -965,6 +1056,7 @@ final class MeetObserver: @unchecked Sendable {
     private var timer: DispatchSourceTimer?
     private var web: AXUIElement?
     private var region: AXUIElement?
+    private var languageControl: AXUIElement?
     private var tick = 0
     private var nextSearch = Date.distantPast
     private var lostAt: Date?
@@ -990,8 +1082,25 @@ final class MeetObserver: @unchecked Sendable {
         return lock.withLock { tracker.snapshot(now: now) }
     }
 
-    /// The Meet page is found and being read.
-    var active: Bool { lock.withLock { reading } }
+    /// The Meet page is found and being read, or the browser extension is sending its captions.
+    var active: Bool {
+        let now = clock()
+        return lock.withLock { reading || tracker.feeding(at: now) }
+    }
+
+    /// Captions from the Earshot browser extension. False when they are for another call than this one.
+    func feed(_ blocks: [MeetCaptionBlock], code: String?) -> Bool {
+        let t = clock()
+        let ch = lock.withLock { () -> MeetTracker.Changes? in
+            if let code, let mine = tracker.context.meetingCode, code != mine { return nil }
+            let was = tracker.feeding(at: t)
+            if !was { LiveDebug.log("[meet] captions from the browser extension") }
+            return tracker.feed(blocks, at: t)
+        }
+        guard let ch else { return false }
+        deliver(ch)
+        return true
+    }
 
     /// Turn Meet's captions on when a call starts with them off (one press per call, never retried).
     var autoEnableCaptions: Bool {
@@ -1087,6 +1196,7 @@ final class MeetObserver: @unchecked Sendable {
             axThread = nil
             web = nil
             region = nil
+            languageControl = nil
             lock.withLock { reading = false; mic = nil }
             if setManual { AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanFalse) }
             setManual = false
@@ -1159,6 +1269,7 @@ final class MeetObserver: @unchecked Sendable {
         }
         let page = MeetParse.page(nodes)
         region = page.captionIndex.map { elements[$0] }
+        languageControl = page.languageIndex.map { elements[$0] }
         let newMic = page.micIndex.map { elements[$0] }
         let url = (Self.attribute(web, "AXURL") as? URL)?.absoluteString
         let title = Self.pageTitle(Self.attribute(web, kAXTitleAttribute) as? String)
@@ -1177,6 +1288,43 @@ final class MeetObserver: @unchecked Sendable {
         if ch.pressCaptions, let i = page.captionsControl { pressCaptions(elements[i], nodes[i]) }
         logStatus(nodes: nodes.count, phase: page.phase)
         deliver(ch)
+    }
+
+    /// Meet's captions language as last read (ISO 639-1); nil while captions or the page can't be read.
+    var captionLanguage: String? { lock.withLock { tracker.context.captionLanguage } }
+
+    /// Picks `code` in Meet's "Meeting language" control: opens it, presses that language in the list, and checks
+    /// the page shows it 2.5 s later. One attempt; `done` says whether it took.
+    func setCaptionLanguage(_ code: String, done: @escaping @Sendable (Bool) -> Void) {
+        queue.async { [self] in
+            guard web != nil, let control = languageControl,
+                  AXUIElementPerformAction(control, kAXPressAction as CFString) == .success else {
+                LiveDebug.log("[meet] caption language \(code): no language control to open")
+                done(false)
+                return
+            }
+            queue.asyncAfter(deadline: .now() + 0.8) { [self] in
+                guard let web else { done(false); return }
+                let (nodes, elements) = Self.walk(web, limit: 8000)
+                let own = elements.firstIndex { CFEqual($0, control) }
+                guard let i = MeetParse.languageOption(nodes, code: code, control: own) else {
+                    let seen = nodes.filter { MeetParse.exactLanguage($0.label.isEmpty ? $0.text : $0.label) != nil }
+                        .prefix(8).map { "\($0.role) \"\($0.label.isEmpty ? $0.text : $0.label)\" d\($0.depth)" }
+                    LiveDebug.log("[meet] caption language \(code): not in the list (saw \(seen.joined(separator: ", ")))")
+                    _ = AXUIElementPerformAction(control, kAXPressAction as CFString)  // close the list again
+                    done(false)
+                    return
+                }
+                let pressed = AXUIElementPerformAction(elements[i], kAXPressAction as CFString) == .success
+                LiveDebug.log("[meet] caption language \(code): pressed \(nodes[i].role) \"\(nodes[i].label.isEmpty ? nodes[i].text : nodes[i].label)\" \(pressed ? "ok" : "failed")")
+                queue.asyncAfter(deadline: .now() + 2.5) { [self] in
+                    fullScan()
+                    let now = captionLanguage
+                    if now != code { LiveDebug.log("[meet] caption language \(code): page still shows \(now ?? "?")") }
+                    done(pressed && now == code)
+                }
+            }
+        }
     }
 
     /// Presses Meet's captions control, after checking it is still that control. A failure isn't retried.

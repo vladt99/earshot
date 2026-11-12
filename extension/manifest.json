@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Earshot for Google Meet",
+  "version": "1.0.0",
+  "description": "Sends Google Meet's captions to Earshot on your Mac, even while the Meet tab is in the background.",
+  "permissions": ["storage"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [{ "matches": ["https://meet.google.com/*"], "js": ["content.js"], "run_at": "document_idle" }],
+  "options_ui": { "page": "options.html", "open_in_tab": false },
+  "action": { "default_title": "Earshot", "default_popup": "options.html" },
+  "icons": { "16": "icon16.png", "48": "icon48.png", "128": "icon128.png" }
+}

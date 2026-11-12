@@ -484,6 +484,15 @@ final class MeetingSession {
     fileprivate var language: String?
     /// Picked by the user for this meeting: the caption language doesn't replace it.
     private let languagePinned: Bool
+    /// The language Meet's captions should show: the one picked for this meeting, or the one heard in it.
+    private var captionTarget: String?
+    /// Earshot changed Meet's caption language once (or tried): never again in this call.
+    private var captionSetTried = false
+    /// Meet's caption language as last read, and whether it changed during the call without Earshot (the user did it).
+    private var meetLanguageSeen: String?
+    private var meetLanguageManual = false
+    /// Listens to the others' audio until it knows the spoken language (Settings.autoCaptionLanguage, language on Auto).
+    private var languageWatch: Task<Void, Never>?
     /// Model of the latest live pass (Parakeet covers a non-English meeting until Whisper has loaded).
     fileprivate var liveModel: String?
     /// Diarizer speaker id → stable "Speaker N" label, numbered by first appearance.
@@ -507,6 +516,7 @@ final class MeetingSession {
         let id = UUID().uuidString.lowercased(), now = Date()
         self.language = language ?? Settings.language
         self.languagePinned = language != nil
+        self.captionTarget = language.flatMap(MeetingController.languageCode)
         self.id = id
         self.startedAt = now
         self.origin = origin
@@ -657,6 +667,7 @@ final class MeetingSession {
         publish()
         diarizeTask?.cancel()
         watchTask?.cancel()
+        languageWatch?.cancel()
         contextChanged()
         observer?.stop()
         writeContext()
@@ -732,7 +743,93 @@ final class MeetingSession {
         }
         o.start()
         contextChanged()
+        watchLanguage()
     }
+
+    // MARK: Meet's caption language
+
+    /// Languages detection may switch to: English, the one picked in Earshot, Meet's current one and those remembered
+    /// for any meeting. Whisper's guesses outside them (Portuguese for accented English) are ignored.
+    private static func knownLanguages(meet: String?) -> Set<String> {
+        let m = PreJoinWatcher.memory
+        let remembered = (Array(m.codes.values) + Array(m.series.values)).map(\.language)
+        return Set((["en", Settings.language, meet].compactMap { $0 } + remembered).compactMap(MeetingController.languageCode))
+    }
+
+    /// Waits for 15 s of the others' speech, then asks Whisper which language it is (up to 3 samples, first 10 min).
+    private func watchLanguage() {
+        guard Settings.autoCaptionLanguage, captionTarget == nil, meetBundle != nil, !isStopping else { return }
+        let sink = othersSink, rate = SampleSink.rate
+        languageWatch = Task { [weak self] in
+            var cursor = sink.total, pending: [Float] = [], speech: [Float] = [], tries = 0
+            let started = Date()
+            while !Task.isCancelled, Date().timeIntervalSince(started) < 600, tries < 3 {
+                try? await Task.sleep(for: .seconds(3))
+                guard let self, self.captionTarget == nil, !self.meetLanguageManual, !self.isStopping else { return }
+                pending += sink.read(from: cursor)
+                cursor = sink.total
+                guard pending.count >= Int(rate * 10) else { continue }
+                let chunk = pending
+                pending = []
+                speech += await Task.detached(priority: .utility) {
+                    WhisperSupport.speechChunks(chunk).flatMap { chunk[$0] }
+                }.value
+                guard speech.count >= Int(rate * 15) else { continue }
+                tries += 1
+                let sample = speech
+                speech = []
+                guard let heard = await Engine.shared.spokenLanguage(sample) else {
+                    LiveDebug.log("[meet] language: Whisper isn't installed or couldn't tell")
+                    return
+                }
+                let known = Self.knownLanguages(meet: self.observer?.captionLanguage)
+                LiveDebug.log("[meet] language: heard \(heard.code) p=\(String(format: "%.2f", heard.probability)) (try \(tries))")
+                if known.contains(heard.code), heard.probability >= 0.75 {
+                    self.heardLanguage(heard.code)
+                    return
+                }
+            }
+        }
+    }
+
+    /// The spoken language is known: Earshot transcribes in it, Meet's captions follow, and the meeting's series
+    /// remembers it for next time.
+    private func heardLanguage(_ code: String) {
+        guard captionTarget == nil, !meetLanguageManual, !isStopping else { return }
+        captionTarget = code
+        if code != language.flatMap(MeetingController.languageCode) {
+            LiveDebug.log("[meet] language \(code) heard: live passes switch to it")
+            language = code
+            streams.forEach { $0.languageChanged() }
+        }
+        let c = observer?.context
+        PreJoinWatcher.rememberLanguage(code, action: save ? "record" : "captions", code: c?.meetingCode,
+                                        eventID: c?.calendar?.eventID ?? calendar?.eventID, title: genericTitle ? nil : title)
+        contextChanged()
+    }
+
+    /// Meet's captions show another language than `captionTarget`: switch them, once per call, unless the user
+    /// changed them during the call.
+    private func syncCaptionLanguage(_ shown: String?) {
+        guard let shown else { return }
+        if let seen = meetLanguageSeen, seen != shown, !captionSetTried { meetLanguageManual = true }
+        meetLanguageSeen = shown
+        guard Settings.autoCaptionLanguage, !captionSetTried, !meetLanguageManual, let target = captionTarget, shown != target,
+              let observer else { return }
+        captionSetTried = true
+        LiveDebug.log("[meet] captions in \(shown), meeting in \(target): switching Meet's captions")
+        observer.setCaptionLanguage(target) { ok in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if ok { self.meetLanguageSeen = target }
+                EventBus.shared.publish("meeting.caption_language", ["meeting_id": self.id, "language": target, "changed": ok])
+            }
+        }
+    }
+
+    /// Captions from the Earshot browser extension: false when this session doesn't read a Meet call, or reads
+    /// another one.
+    func browserCaptions(_ blocks: [MeetCaptionBlock], code: String?) -> Bool { observer?.feed(blocks, code: code) ?? false }
 
     /// The pre-join watcher's page tree for this session's browser: the observer switches it off when it stops.
     func adoptWebTree(_ bundle: String) -> Bool {
@@ -781,6 +878,7 @@ final class MeetingSession {
                 streams.forEach { $0.languageChanged() }
             }
         }
+        syncCaptionLanguage(c.captionLanguage.flatMap(MeetingController.languageCode))
         if genericTitle, let better = [c.title, c.calendar?.title].compactMap({ $0?.trimmingCharacters(in: .whitespacesAndNewlines) })
             .first(where: { !$0.isEmpty && $0 != c.meetingCode }) {
             title = better

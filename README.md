@@ -135,6 +135,22 @@ To uninstall, delete the app and, if you want to remove your data as well,
 5. Leave the call. Earshot stops as soon as Meet shows its end screen, saves the transcript and replaces it with
    the polished version shortly after.
 
+**Caption language.** Meet's captions need the right language, and Earshot sets it for you (Settings → Record
+Meetings → Set Meet's caption language automatically). A language picked on the pre-join screen, or remembered for the
+meeting or its series, goes straight to Meet's "Meeting language". On Auto, Earshot listens to the first 15 seconds of
+the others' speech with Whisper's language detection (only when Whisper is installed). If it's sure, and the language
+is one you use (English, Earshot's language or one remembered for a meeting), it switches its own transcription and
+Meet's captions to it, and remembers it for that series. It does this once per call, and never after you changed the
+language in Meet yourself.
+
+**Meet in a background tab.** Chrome only shows macOS the tab you're looking at, so when you switch tabs Earshot
+stops seeing Meet's captions and speakers fall back to Speaker 1, 2, …. The **Earshot for Google Meet** extension
+(Chrome, Edge, Brave, Arc) keeps sending the captions from inside the page: Settings → Integrations → Show Extension
+Folder, then in `chrome://extensions` turn on Developer mode, click **Load unpacked**, pick that folder and paste the
+token from **Copy Extension Token** into the extension's options. The token only lets it post captions; while it
+sends them, Earshot uses them in place of the ones it reads from the page. People, chat and mute state still need
+the tab in front (or Meet in a window of its own).
+
 macOS gives one audio stream for the whole browser, so a video playing in another tab of the same browser ends up
 in the transcript. Run Meet in a different browser from the one you use for media.
 
@@ -249,7 +265,7 @@ The OpenAI SDKs work with `base_url="http://127.0.0.1:7788/v1"` and the token as
 
 | Method & path | What |
 |---|---|
-| `GET /v1/events[?filter=meeting.,job.]` | Server-Sent Events: `meeting.detected`, `meeting.prejoin`, `meeting.started`, `meeting.partial`, `meeting.segment`, `meeting.speakers_revised`, `meeting.note`, `meeting.warning`, `meeting.capture_restarted`, `meeting.ended_detected`, `meeting.resumed_after_sleep`, `meeting.saved`, `meeting.polishing`, `meeting.finalized`, `meeting.retranscribed`, `meeting.recovered`, `meeting.kept`, `meeting.speaker_named`, `meeting.mic_muted`, `meeting.mic_unmuted`, `audio.tap_fallback`, `audio.echo_cancellation_bypassed`, `job.done`, `job.failed`. `filter` takes prefixes (`meeting.`) or `*` |
+| `GET /v1/events[?filter=meeting.,job.]` | Server-Sent Events: `meeting.detected`, `meeting.prejoin`, `meeting.started`, `meeting.partial`, `meeting.segment`, `meeting.speakers_revised`, `meeting.note`, `meeting.warning`, `meeting.capture_restarted`, `meeting.ended_detected`, `meeting.resumed_after_sleep`, `meeting.saved`, `meeting.polishing`, `meeting.finalized`, `meeting.retranscribed`, `meeting.recovered`, `meeting.kept`, `meeting.speaker_named`, `meeting.mic_muted`, `meeting.mic_unmuted`, `meeting.caption_language`, `audio.tap_fallback`, `audio.echo_cancellation_bypassed`, `job.done`, `job.failed`. `filter` takes prefixes (`meeting.`) or `*` |
 | `GET /v1/meetings/current[?format=text]` | The running meeting's live transcript, notes, warnings, `context`, `self_muted`, `live_captions` and `saved` |
 | `POST /v1/meetings/current/keep` | Save the running Live Captions as a meeting |
 | `POST /v1/meetings/current/notes` `{"text"}` · `POST /v1/meetings/current/bookmark` | Add a note or bookmark now |
@@ -261,6 +277,7 @@ The OpenAI SDKs work with `base_url="http://127.0.0.1:7788/v1"` and the token as
 | `GET /v1/meetings?series=` | Meetings of one series (a `series_id` from the list, a calendar series id or a title) |
 | `GET /v1/speakers` | Every named speaker with meeting count, line count and last seen |
 | `GET /v1/speakers/{name}/lines?limit=&since=&q=` | One person's lines across all meetings, newest first; matches names case- and accent-insensitively, and first names or emails through the participant list |
+| `POST /v1/meet/captions` `{"code", "page", "blocks": [{"id", "speaker", "text"}]}` | Meet's caption blocks as shown now, oldest first (what the browser extension sends, with the `browser_token` from `api.json`, which is good for nothing else) |
 | `GET /v1/diagnostics` | The same plain-text report as Settings → About → Copy Diagnostics |
 
 ### Models, settings, dictation

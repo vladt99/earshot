@@ -122,6 +122,57 @@ struct MeetTrackerTests {
         #expect(t.context.participants.map(\.name).contains("Bob"))
     }
 
+    @Test func languageNamesExactly() {
+        #expect(MeetParse.exactLanguage("Română") == "ro")
+        #expect(MeetParse.exactLanguage("English (United States)") == "en")
+        #expect(MeetParse.exactLanguage("English captions are on") == nil)
+        #expect(MeetParse.exactLanguage("Hello") == nil)
+    }
+
+    @Test func languageOptionInOpenList() {
+        let n = { (d: Int, role: String, title: String) in MeetNode(depth: d, role: role, title: title) }
+        let nodes = [
+            n(0, "AXGroup", ""),
+            n(1, "AXComboBox", "Meeting language"),                // the control, showing English
+            n(1, "AXGroup", "Captions"),
+            n(2, "AXStaticText", "Română"),                        // caption text, not a list entry
+            n(1, "AXList", ""),
+            n(2, "AXStaticText", "English (India)"),
+            n(2, "AXStaticText", "English (United States)"),
+            n(2, "AXMenuItem", "Română"),
+            n(3, "AXStaticText", "Română"),
+        ]
+        #expect(MeetParse.languageOption(nodes, code: "ro", control: 1) == 7)
+        #expect(MeetParse.languageOption(nodes, code: "en", control: 1) == 6)
+        #expect(MeetParse.languageOption(nodes, code: "de", control: 1) == nil)
+        // No list open: nothing to press, even with the name on the page.
+        #expect(MeetParse.languageOption(Array(nodes.prefix(4)), code: "ro", control: 1) == nil)
+    }
+
+    @Test func extensionTakesOverWithoutDuplicates() {
+        var t = MeetTracker()
+        // Page tree (tab in front): Alice, then Bob talking.
+        _ = t.captions([MeetCaptionBlock(key: 1, speaker: "Alice", text: "first point")], at: 0)
+        _ = t.captions([MeetCaptionBlock(key: 1, speaker: "Alice", text: "first point"),
+                        MeetCaptionBlock(key: 2, speaker: "Bob", text: "I agree")], at: 1)
+        // Tab goes to the background: the extension shows the same blocks under its own keys, Bob still talking.
+        _ = t.feed([MeetCaptionBlock(key: 101, speaker: "Alice", text: "first point"),
+                    MeetCaptionBlock(key: 102, speaker: "Bob", text: "I agree with that")], at: 2)
+        #expect(t.context.captions.map(\.speaker) == ["Alice", "Bob"])
+        #expect(t.context.captions[1].text == "I agree with that")
+        // While it feeds, the page tree's captions are ignored.
+        #expect(t.captions([MeetCaptionBlock(key: 3, speaker: "Carol", text: "hi")], at: 2.5) == [])
+        // A new speaker through the extension is a new turn.
+        #expect(t.feed([MeetCaptionBlock(key: 102, speaker: "Bob", text: "I agree with that"),
+                        MeetCaptionBlock(key: 103, speaker: "Carol", text: "me too")], at: 3).speakers == ["Carol"])
+        #expect(t.context.captions.map(\.speaker) == ["Alice", "Bob", "Carol"])
+        // The extension stops; back on the page tree, Carol's block continues her turn (after that long a pause, as a
+        // new turn holding only the new words, never "me too" again).
+        _ = t.captions([MeetCaptionBlock(key: 4, speaker: "Carol", text: "me too and ship it")], at: 3 + MeetTracker.feedStale + 1)
+        #expect(t.context.captions.map(\.speaker) == ["Alice", "Bob", "Carol", "Carol"])
+        #expect(t.context.captions[3].text == "and ship it")
+    }
+
     @Test func captionsOnScreenBeforeReadingAreNotTimed() {
         var t = MeetTracker()
         let old = MeetCaptionBlock(key: 1, speaker: "Alice", text: "earlier words")

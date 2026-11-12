@@ -454,6 +454,17 @@ final class PreJoinWatcher {
         (try? Data(contentsOf: memoryURL)).flatMap { try? JSONDecoder().decode(PreJoinMemory.self, from: $0) } ?? PreJoinMemory()
     }
 
+    /// The language heard in a call, for the next one of the same meeting or series. A remembered action stays; a
+    /// new entry takes this call's ("record" or "captions").
+    static func rememberLanguage(_ language: String, action: String, code: String?, eventID: String?, title: String?) {
+        var m = memory
+        var c = m.choice(code: code, eventID: eventID, title: title) ?? PreJoinChoice(language: language, action: action)
+        c.language = language
+        c.at = Date()
+        m.remember(c, code: code, eventID: eventID, title: title)
+        try? JSONEncoder().encode(m).write(to: memoryURL, options: .atomic)
+    }
+
     private func remember(_ o: PreJoinOffer) {
         var m = Self.memory
         m.remember(PreJoinChoice(language: o.language, action: o.action), code: o.code, eventID: o.eventID, title: o.title)
