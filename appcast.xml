@@ -6,6 +6,15 @@
     <description>Earshot updates</description>
     <language>en</language>
     <item>
+      <title>Earshot 0.13.0</title>
+      <pubDate>Thu, 12 Nov 2026 15:46:35 GMT</pubDate>
+      <sparkle:version>14</sparkle:version>
+      <sparkle:shortVersionString>0.13.0</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+      <sparkle:releaseNotesLink>https://github.com/vladt99/earshot/releases/tag/v0.13.0</sparkle:releaseNotesLink>
+      <enclosure url="https://github.com/vladt99/earshot/releases/download/v0.13.0/Earshot.zip" length="16280708" type="application/octet-stream" sparkle:edSignature="xzvJ51PcPxCBmlTGqjAfmEqBDckjlNzM+hHoasb5x3CIgRN4WwzgvRZszi9RITebcTdreRhTG+3MwuQ3tOcxAQ=="/>
+    </item>
+    <item>
       <title>Earshot 0.12.0</title>
       <pubDate>Fri, 30 Oct 2026 10:08:41 GMT</pubDate>
       <sparkle:version>13</sparkle:version>
